@@ -1,0 +1,76 @@
+# Публикация пакета mailinfra в PyPI.
+#
+# Этот репозиторий — публичное зеркало sdk/python из монорепозитория
+# MailInfra. Его выкладывает sdk/scripts/release-mirror.sh вместе с тегом
+# vX.Y.Z, тег запускает этот workflow. Правки сюда напрямую не вносятся:
+# следующий релиз перезапишет их содержимым монорепозитория.
+#
+# ── Что нужно настроить один раз ────────────────────────────────────────────
+# 1. PyPI → Publishing → Add a new pending publisher:
+#      Project: mailinfra, Owner: g7AzaZLO, Repository: mailinfra-python,
+#      Workflow: release.yml, Environment: release
+#    Токен в секретах не нужен: публикация идёт по OIDC (Trusted Publishing).
+# 2. Settings → Environments → release: Required reviewers — владелец;
+#    Deployment branches and tags — только теги `v*`. Публикация ждёт Approve.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          python-version: "3.12"
+
+      - name: Сверить версию тега с pyproject.toml
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::Тег $GITHUB_REF_NAME не совпадает с version=$pkg_version в pyproject.toml"
+            exit 1
+          fi
+
+      - name: Тесты
+        run: |
+          uv sync
+          uv run pytest -q
+
+      - name: Сборка
+        run: uv build
+
+      - name: twine check
+        run: uvx twine check dist/*
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: python-dist
+          path: dist/*
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # Обязательно для Trusted Publishing и аттестаций — без этого OIDC-токен
+      # не выдаётся.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+        with:
+          packages-dir: dist
+          print-hash: true

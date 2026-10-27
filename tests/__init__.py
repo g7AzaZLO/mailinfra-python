@@ -1,0 +1,1 @@
+"""Тесты Python SDK MailInfra."""

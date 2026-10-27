@@ -1,0 +1,1408 @@
+{
+  "components": {
+    "schemas": {
+      "BatchSendError": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "details": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "message": {
+            "type": "string"
+          },
+          "status_code": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status_code",
+          "code",
+          "message"
+        ],
+        "title": "BatchSendError",
+        "type": "object"
+      },
+      "BatchSendRequest": {
+        "properties": {
+          "emails": {
+            "items": {
+              "$ref": "#/components/schemas/EmailSendRequest"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "emails"
+        ],
+        "title": "BatchSendRequest",
+        "type": "object"
+      },
+      "BatchSendResponseData": {
+        "properties": {
+          "accepted_count": {
+            "type": "integer"
+          },
+          "failed_count": {
+            "type": "integer"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/BatchSendResult"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "results",
+          "accepted_count",
+          "failed_count"
+        ],
+        "title": "BatchSendResponseData",
+        "type": "object"
+      },
+      "BatchSendResult": {
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BatchSendError"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "index": {
+            "type": "integer"
+          },
+          "skipped_recipients": {
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "index"
+        ],
+        "title": "BatchSendResult",
+        "type": "object"
+      },
+      "BounceCategory": {
+        "description": "Нормализованная причина bounce — для UI/Debug Explorer.\n\nОтдельно от BounceType (hard/soft): категория даёт человекочитаемую\nпричину, вычисляется классификатором по enhanced-коду/тексту диагностики.\nСм. app.services.bounce_parser.classify_bounce_category.",
+        "enum": [
+          "invalid-recipient",
+          "mailbox-full",
+          "message-too-large",
+          "content-spam-block",
+          "policy-rejection",
+          "reputation-blocklist",
+          "greylisting",
+          "dns-mx-failure",
+          "connection-error",
+          "rate-limited",
+          "auth-failure",
+          "unknown"
+        ],
+        "title": "BounceCategory",
+        "type": "string"
+      },
+      "BounceType": {
+        "enum": [
+          "hard",
+          "soft"
+        ],
+        "title": "BounceType",
+        "type": "string"
+      },
+      "DataResponse_BatchSendResponseData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/BatchSendResponseData"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "DataResponse[BatchSendResponseData]",
+        "type": "object"
+      },
+      "DataResponse_EmailDetail_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/EmailDetail"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "DataResponse[EmailDetail]",
+        "type": "object"
+      },
+      "DataResponse_EmailSendResponseData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/EmailSendResponseData"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "DataResponse[EmailSendResponseData]",
+        "type": "object"
+      },
+      "DataResponse_list_EmailEventPublic__": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/EmailEventPublic"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "DataResponse[list[EmailEventPublic]]",
+        "type": "object"
+      },
+      "DataResponse_list_EmailListItem__": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/EmailListItem"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "DataResponse[list[EmailListItem]]",
+        "type": "object"
+      },
+      "DkimSigningStatus": {
+        "description": "Достоверность DKIM-подписи письма.\n\n``EXPECTED`` — на нашей стороне известно, что домен верифицирован и\nключ для него существует, поэтому Haraka *должна* была подписать письмо.\nЭто не подтверждение факта подписи — Haraka сегодня не сообщает результат\nподписания обратно. ``CONFIRMED``/``FAILED`` зарезервированы под будущий\ncallback от Haraka (fast-follow), значения уже есть, миграция не нужна.",
+        "enum": [
+          "expected",
+          "confirmed",
+          "failed",
+          "not_signed"
+        ],
+        "title": "DkimSigningStatus",
+        "type": "string"
+      },
+      "EmailAttachmentInput": {
+        "description": "Вложение в исходящем письме.\n\n`content_base64` — содержимое файла в base64. Совокупный размер всех\nвложений и пер-файловые лимиты валидируются в\n`app.services.attachments.normalize_attachments`.",
+        "properties": {
+          "content_base64": {
+            "maxLength": 14348938,
+            "type": "string"
+          },
+          "content_type": {
+            "default": "application/octet-stream",
+            "maxLength": 255,
+            "type": "string"
+          },
+          "filename": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "filename",
+          "content_base64"
+        ],
+        "title": "EmailAttachmentInput",
+        "type": "object"
+      },
+      "EmailDetail": {
+        "properties": {
+          "bcc_emails": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "bounce_category": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BounceCategory"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "bounce_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BounceType"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cc_emails": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "delivered_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dkim_aligned": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "dkim_d": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dkim_selector": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dkim_signing_status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DkimSigningStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dmarc_aligned": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "failed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "final_smtp_code": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "final_smtp_enhanced": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "final_smtp_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_email": {
+            "type": "string"
+          },
+          "from_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "html_body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "message_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "reply_to": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sent_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/EmailSource",
+            "default": "API"
+          },
+          "spf_aligned": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "spf_authorized_ip": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "spf_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/EmailStatus"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "suppression_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SuppressionReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "text_body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_emails": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "from_email",
+          "to_emails",
+          "subject",
+          "status",
+          "tags",
+          "created_at",
+          "sent_at",
+          "delivered_at",
+          "from_name",
+          "cc_emails",
+          "bcc_emails",
+          "reply_to",
+          "html_body",
+          "text_body",
+          "headers",
+          "failed_at"
+        ],
+        "title": "EmailDetail",
+        "type": "object"
+      },
+      "EmailEventPublic": {
+        "properties": {
+          "data": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "ip_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timestamp": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/EmailEventType"
+          },
+          "user_agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "data",
+          "timestamp"
+        ],
+        "title": "EmailEventPublic",
+        "type": "object"
+      },
+      "EmailEventType": {
+        "enum": [
+          "queued",
+          "sending",
+          "sent",
+          "delivered",
+          "smtp_connected",
+          "opened",
+          "clicked",
+          "bounced",
+          "complained",
+          "failed",
+          "simulated",
+          "deferred"
+        ],
+        "title": "EmailEventType",
+        "type": "string"
+      },
+      "EmailListItem": {
+        "description": "Сокращённая репрезентация для списка.",
+        "properties": {
+          "bounce_category": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BounceCategory"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "bounce_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BounceType"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "delivered_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dkim_aligned": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "dkim_d": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dkim_selector": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dkim_signing_status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DkimSigningStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dmarc_aligned": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "final_smtp_code": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "final_smtp_enhanced": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "final_smtp_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_email": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "message_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "sent_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/EmailSource",
+            "default": "API"
+          },
+          "spf_aligned": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "spf_authorized_ip": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "spf_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/EmailStatus"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "suppression_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SuppressionReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "to_emails": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "from_email",
+          "to_emails",
+          "subject",
+          "status",
+          "tags",
+          "created_at",
+          "sent_at",
+          "delivered_at"
+        ],
+        "title": "EmailListItem",
+        "type": "object"
+      },
+      "EmailSendRequest": {
+        "description": "POST /v1/emails.",
+        "properties": {
+          "attachments": {
+            "items": {
+              "$ref": "#/components/schemas/EmailAttachmentInput"
+            },
+            "maxItems": 10,
+            "type": "array"
+          },
+          "bcc": {
+            "items": {
+              "format": "email",
+              "type": "string"
+            },
+            "maxItems": 50,
+            "type": "array"
+          },
+          "cc": {
+            "items": {
+              "format": "email",
+              "type": "string"
+            },
+            "maxItems": 50,
+            "type": "array"
+          },
+          "from": {
+            "format": "email",
+            "type": "string"
+          },
+          "from_name": {
+            "maxLength": 200,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "html": {
+            "maxLength": 26214400,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reply_to": {
+            "items": {
+              "format": "email",
+              "type": "string"
+            },
+            "maxItems": 10,
+            "type": "array"
+          },
+          "subject": {
+            "maxLength": 998,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "type": "array"
+          },
+          "template": {
+            "maxLength": 100,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "maxLength": 26214400,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to": {
+            "items": {
+              "format": "email",
+              "type": "string"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "type": "array"
+          },
+          "variables": {
+            "additionalProperties": true,
+            "type": "object"
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ],
+        "title": "EmailSendRequest",
+        "type": "object"
+      },
+      "EmailSendResponseData": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "skipped_recipients": {
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/EmailStatus"
+          }
+        },
+        "required": [
+          "id",
+          "status"
+        ],
+        "title": "EmailSendResponseData",
+        "type": "object"
+      },
+      "EmailSource": {
+        "description": "Транспорт, через который письмо попало в пайплайн отправки.",
+        "enum": [
+          "API",
+          "SMTP",
+          "CAMPAIGN"
+        ],
+        "title": "EmailSource",
+        "type": "string"
+      },
+      "EmailStatus": {
+        "enum": [
+          "QUEUED",
+          "SENDING",
+          "SENT",
+          "DELIVERED",
+          "BOUNCED",
+          "COMPLAINED",
+          "FAILED",
+          "SIMULATED"
+        ],
+        "title": "EmailStatus",
+        "type": "string"
+      },
+      "ErrorDetails": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "details": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ErrorDetails",
+        "type": "object"
+      },
+      "ErrorResponse": {
+        "description": "Единый конверт ошибки. Собирается в ``app.main.error_response``.\n\nРовно эта форма отдаётся всеми обработчиками исключений — доменными\n(``MailInfraError``), валидационными и fallback'ом на непойманное\nисключение. Схема подключена к OpenAPI через ``ERROR_RESPONSES``, чтобы\nсгенерированные клиенты знали структуру ошибки, а не только её код.",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetails"
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse",
+        "type": "object"
+      },
+      "SuppressionReason": {
+        "enum": [
+          "HARD_BOUNCE",
+          "COMPLAINT",
+          "UNSUBSCRIBE",
+          "MANUAL"
+        ],
+        "title": "SuppressionReason",
+        "type": "string"
+      }
+    },
+    "securitySchemes": {
+      "ApiKeyBearer": {
+        "description": "API-ключ проекта: `mi_live_…` для рабочих отправок, `mi_test_…` для sandbox. Создаётся в дашборде, показывается один раз.",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "contact": {
+      "name": "MailInfra",
+      "url": "https://docs.mailinfra.ru"
+    },
+    "description": "Публичный API MailInfra — отправка писем и чтение их статусов по API-ключу проекта.\n\nАутентификация: `Authorization: Bearer mi_live_…` (рабочие отправки) или\n`Bearer mi_test_…` (sandbox: письмо сохраняется со статусом `SIMULATED`,\nне доставляется и не расходует месячный объём).\n\nВсе ошибки приходят единым конвертом `{\"error\": {\"code\", \"message\", \"details\"},\n\"request_id\"}` — парсите `error.code`, не текст сообщения.\n\nОфициальные SDK: Python (`pip install mailinfra`), Node/TS (`npm i mailinfra`).\nПолная документация — https://docs.mailinfra.ru\n",
+    "title": "MailInfra Public API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/emails": {
+      "get": {
+        "operationId": "list_emails",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/EmailStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "from_email",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "to_email",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "tag",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_list_EmailListItem__"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Ошибка. Единый конверт: error.code, error.message, error.details, request_id",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "List Emails",
+        "tags": [
+          "emails"
+        ]
+      },
+      "post": {
+        "operationId": "send_email",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmailSendRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_EmailSendResponseData_"
+                }
+              }
+            },
+            "description": "Идемпотентный повтор: запрос с таким `Idempotency-Key` уже был принят, письмо повторно не отправлено.",
+            "headers": {
+              "Idempotent-Replayed": {
+                "description": "`true`, если это идемпотентный повтор: письмо было принято первым запросом с тем же `Idempotency-Key`, ответ отдан из сохранённого результата и повторной отправки не произошло.",
+                "schema": {
+                  "enum": [
+                    "true"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_EmailSendResponseData_"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Превышен лимит отправки: месячный объём плана (`error.code = monthly_limit_exceeded`, в `error.details` — `limit`, `used`, `resets_at` и `period` — расчётный месяц `YYYY-MM`), дневной потолок организации (`daily_send_cap_exceeded`, в `error.details` — `cap` и `resets_at`) или дневной лимит писем тестовых ключей. Заголовок `Retry-After` содержит задержку до повтора.",
+            "headers": {
+              "Retry-After": {
+                "description": "Сколько секунд подождать до безопасного повтора запроса.",
+                "schema": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Ошибка. Единый конверт: error.code, error.message, error.details, request_id",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Send Email",
+        "tags": [
+          "emails"
+        ]
+      }
+    },
+    "/emails/batch": {
+      "post": {
+        "operationId": "send_batch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchSendRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_BatchSendResponseData_"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Ошибка. Единый конверт: error.code, error.message, error.details, request_id",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Send Batch",
+        "tags": [
+          "emails"
+        ]
+      }
+    },
+    "/emails/{email_id}": {
+      "get": {
+        "operationId": "get_email",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "email_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_EmailDetail_"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Ошибка. Единый конверт: error.code, error.message, error.details, request_id",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Get Email",
+        "tags": [
+          "emails"
+        ]
+      }
+    },
+    "/emails/{email_id}/events": {
+      "get": {
+        "operationId": "list_email_events",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "email_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_list_EmailEventPublic__"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Ошибка. Единый конверт: error.code, error.message, error.details, request_id",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "List Email Events",
+        "tags": [
+          "emails"
+        ]
+      }
+    }
+  },
+  "security": [
+    {
+      "ApiKeyBearer": []
+    }
+  ],
+  "servers": [
+    {
+      "description": "Production",
+      "url": "https://app.mailinfra.ru/v1"
+    }
+  ],
+  "tags": [
+    {
+      "description": "Отправка писем и чтение их статусов и событий.",
+      "name": "emails"
+    }
+  ]
+}

@@ -1,0 +1,113 @@
+[project]
+name = "mailinfra"
+version = "0.1.0"
+description = "Официальный Python SDK для MailInfra — email API для разработчиков"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "MailInfra" }]
+keywords = ["mailinfra", "email", "smtp", "transactional-email", "api-client"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Email",
+    "Typing :: Typed",
+]
+
+# Зависимостей ровно две: HTTP-клиент и валидация. SDK ставят в чужие
+# проекты, поэтому нижние границы взяты широко, а верхних нет — иначе пакет
+# начинает конфликтовать с приложением, которое его ставит.
+dependencies = [
+    "httpx>=0.27",
+    # Extra `email` обязателен, а не для красоты: сгенерированные модели
+    # используют `EmailStr` (в спеке у адресов `format: email`), и без
+    # email-validator валидация письма падала бы с ImportError вместо
+    # понятной ошибки поля.
+    "pydantic[email]>=2.7",
+]
+
+[project.urls]
+Homepage = "https://mailinfra.ru"
+Documentation = "https://docs.mailinfra.ru"
+Repository = "https://github.com/g7AzaZLO/mailinfra-python"
+Changelog = "https://github.com/g7AzaZLO/mailinfra-python/blob/main/CHANGELOG.md"
+Issues = "https://github.com/g7AzaZLO/mailinfra-python/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "respx>=0.21",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    # Кодоген моделей из sdk/openapi/mailinfra-public.json. Версия пиньтся,
+    # чтобы перегенерация в CI давала тот же файл, что локально.
+    "datamodel-code-generator==0.26.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mailinfra"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# Сгенерированные модели не форматируем: стиль задаёт datamodel-code-generator,
+# а `ruff format` менял бы кавычки и ломал проверку дрейфа кодогена
+# (перегенерация давала бы diff на каждом прогоне). Линт для них отключён
+# отдельно — см. per-file-ignores.
+extend-exclude = ["src/mailinfra/_generated"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "B",
+    "C4",
+    "UP",
+    "ASYNC",
+    "S",
+    "RET",
+    "SIM",
+]
+ignore = [
+    "E501",  # длину строк держит формат
+    "S101",  # assert'ы в тестах
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106"]
+# Сгенерированный файл не правим руками, поэтому и не линтуем его стиль.
+"src/mailinfra/_generated/*.py" = ["ALL"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+# Сгенерированные модели проверяем только на импортируемость: их стиль
+# задаёт datamodel-code-generator, а не мы.
+exclude = ["src/mailinfra/_generated/"]
+
+[[tool.mypy.overrides]]
+module = "mailinfra._generated.*"
+ignore_errors = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["error"]

@@ -1,0 +1,8 @@
+# Файлы сборки и окружения — в репозиторий SDK не коммитятся.
+.venv/
+dist/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+uv.lock
