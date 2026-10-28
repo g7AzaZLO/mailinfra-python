@@ -25,7 +25,9 @@ __all__ = [
     "ConflictError",
     "DomainNotAttachedError",
     "DomainNotVerifiedError",
+    "EmailNotScheduledError",
     "IdempotencyInFlightError",
+    "IPNotAllowedError",
     "LegalDocumentsNotAcceptedError",
     "MailInfraError",
     "NotFoundError",
@@ -34,6 +36,8 @@ __all__ = [
     "ReservedEmailHeaderError",
     "SandboxRecipientNotAllowedError",
     "SandboxTrialExhaustedError",
+    "SendAtInvalidError",
+    "SendAtTooFarError",
     "ServerError",
     "TemplateRenderError",
     "TemplateVariableMissingError",
@@ -229,6 +233,35 @@ class LegalDocumentsNotAcceptedError(UnprocessableError):
     """
 
 
+class IPNotAllowedError(PermissionDeniedError):
+    """`403` — ключ использован с IP-адреса вне его белого списка.
+
+    Права ключа тут ни при чём: список разрешённых адресов и подсетей
+    задаётся у ключа в дашборде. Повтор с того же адреса не поможет.
+    """
+
+
+class EmailNotScheduledError(ConflictError):
+    """`409` — отменить или перенести можно только письмо в статусе `SCHEDULED`.
+
+    Письмо уже ушло в очередь, отменено или отправлено; текущий статус — в
+    `details["status"]`. Если это ответ на повтор после таймаута, первая
+    попытка, скорее всего, уже выполнила операцию.
+    """
+
+
+class SendAtInvalidError(BadRequestError):
+    """`400` — `send_at` без часового пояса: время не однозначно."""
+
+
+class SendAtTooFarError(BadRequestError):
+    """`400` — `send_at` дальше 7 дней от приёма письма.
+
+    Горизонт считается от момента приёма, а не от переноса: серия переносов
+    не продлевает его. Предел в днях — в `details["max_days"]`.
+    """
+
+
 _STATUS_ERRORS: dict[int, type[MailInfraError]] = {
     400: BadRequestError,
     401: AuthenticationError,
@@ -239,20 +272,25 @@ _STATUS_ERRORS: dict[int, type[MailInfraError]] = {
     429: RateLimitError,
 }
 
-# Коды, которые бэкенд кладёт в `details.code` при отказе отправки.
+# Коды, которые бэкенд кладёт в `details.code` при отказе.
 # Источник истины — места `raise` в `app.services.{email_service,
-# template_service, idempotency, rate_limit}`: только они говорят, какой код
-# реально выбрасывается и с каким статусом.
+# template_service, idempotency, rate_limit, scheduled_email_service}` и
+# `app.api.api_auth`: только они говорят, какой код реально выбрасывается и с
+# каким статусом.
 _CODE_ERRORS: dict[str, type[MailInfraError]] = {
     "all_recipients_suppressed": AllRecipientsSuppressedError,
     "domain_not_attached": DomainNotAttachedError,
     "domain_not_verified": DomainNotVerifiedError,
+    "email_not_scheduled": EmailNotScheduledError,
     "idempotency_in_flight": IdempotencyInFlightError,
+    "ip_not_allowed": IPNotAllowedError,
     "legal_documents_not_accepted": LegalDocumentsNotAcceptedError,
     "reserved_email_header": ReservedEmailHeaderError,
     "rps_exceeded": RateLimitError,
     "sandbox_recipient_not_allowed": SandboxRecipientNotAllowedError,
     "sandbox_trial_exhausted": SandboxTrialExhaustedError,
+    "send_at_invalid": SendAtInvalidError,
+    "send_at_too_far": SendAtTooFarError,
     "template_render_error": TemplateRenderError,
     "template_variable_missing": TemplateVariableMissingError,
 }

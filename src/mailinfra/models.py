@@ -3,7 +3,8 @@
 Тело моделей сгенерировано из `https://docs.mailinfra.ru/openapi/mailinfra-public.json`
 (`mailinfra._generated.models`) — править его руками нельзя, перегенерация
 затрёт. Здесь только публичные имена и то, что генератор выразить не может:
-результат отправки с флагом идемпотентного повтора и удобный тип вложения.
+результаты отправки письма и батча с флагом идемпотентного повтора и удобный
+тип вложения.
 
 Соответствие моделей спеке проверяется автоматически
 (`tests/test_spec_parity.py`), поэтому реэкспорт не может незаметно разойтись
@@ -30,6 +31,9 @@ from ._generated.models import (
     EmailEventPublic,
     EmailEventType,
     EmailListItem,
+    EmailListResponse,
+    EmailRescheduleRequest,
+    EmailScheduleData,
     EmailSendRequest,
     EmailSendResponseData,
     EmailSource,
@@ -53,12 +57,16 @@ __all__ = [
     "EmailEventPublic",
     "EmailEventType",
     "EmailListItem",
+    "EmailListResponse",
+    "EmailRescheduleRequest",
+    "EmailScheduleData",
     "EmailSendRequest",
     "EmailSendResponseData",
     "EmailSource",
     "EmailStatus",
     "ErrorDetails",
     "ErrorResponse",
+    "SendBatchResult",
     "SendEmailResult",
     "SuppressionReason",
 ]
@@ -77,12 +85,16 @@ class Attachment:
         content: Сырые байты файла.
         content_base64: Готовая base64-строка (альтернатива `content`).
         content_type: MIME-тип; по умолчанию `application/octet-stream`.
+        content_id: Content-ID inline-картинки: в HTML на неё ссылаются как
+            `<img src="cid:logo">`. С ним вложение встраивается в тело
+            письма, а не прикладывается файлом.
     """
 
     filename: str
     content: bytes | None = None
     content_base64: str | None = None
     content_type: str = "application/octet-stream"
+    content_id: str | None = None
 
     def __post_init__(self) -> None:
         if (self.content is None) == (self.content_base64 is None):
@@ -94,8 +106,9 @@ class SendEmailResult(BaseModel):
 
     Attributes:
         id: Идентификатор письма в MailInfra.
-        status: Статус сразу после приёма (`QUEUED`, либо `SIMULATED` для
-            sandbox-ключа `mi_test_…`).
+        status: Статус сразу после приёма: `QUEUED`, `SCHEDULED` для письма
+            с `send_at` в будущем или `SIMULATED` для sandbox-ключа
+            `mi_test_…`.
         skipped_recipients: Получатели, которых API отбросил (например,
             адрес в списке подавления) с причиной в значении.
         replayed: `True`, если это идемпотентный повтор: письмо было принято
@@ -140,6 +153,60 @@ class SendEmailResult(BaseModel):
             id=data.id,
             status=data.status,
             skipped_recipients=list(data.skipped_recipients or []),
+            replayed=replayed,
+            idempotency_key=idempotency_key,
+            request_id=request_id,
+        )
+
+
+class SendBatchResult(BatchSendResponseData):
+    """Результат `send_batch()`: письма батча и метаданные запроса.
+
+    Наследует `BatchSendResponseData`, поэтому `results`, `accepted_count` и
+    `failed_count` на месте. Не путать с `BatchSendResult` — результатом
+    одного письма внутри батча (элемент `results`).
+
+    Attributes:
+        replayed: `True`, если ни одно письмо не принято заново: все принятые
+            уже были приняты прежним запросом с тем же `Idempotency-Key`
+            (ответ `200` + `Idempotent-Replayed`). Отклонённые письма при
+            таком повторе API пробует принять снова.
+        idempotency_key: Ключ батча — сгенерированный SDK или переданный
+            вызывающим. Повтор `send_batch()` с ним не продублирует уже
+            принятые письма.
+        request_id: Идентификатор запроса для обращений в поддержку.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    replayed: bool = False
+    idempotency_key: str | None = None
+    request_id: str | None = None
+
+    @classmethod
+    def from_response(
+        cls,
+        data: BatchSendResponseData,
+        *,
+        replayed: bool,
+        idempotency_key: str | None,
+        request_id: str | None,
+    ) -> SendBatchResult:
+        """Собирает результат из данных ответа и метаданных запроса.
+
+        Args:
+            data: Разобранное поле `data` ответа API.
+            replayed: Был ли ответ идемпотентным повтором.
+            idempotency_key: Ключ идемпотентности запроса.
+            request_id: Значение заголовка `X-Request-ID`.
+
+        Returns:
+            Неизменяемый результат батча.
+        """
+        return cls(
+            results=data.results,
+            accepted_count=data.accepted_count,
+            failed_count=data.failed_count,
             replayed=replayed,
             idempotency_key=idempotency_key,
             request_id=request_id,

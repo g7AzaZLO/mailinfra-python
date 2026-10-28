@@ -1,17 +1,18 @@
-"""Ресурс писем: отправка, батч, чтение статусов и событий.
+"""Ресурс писем: отправка, батч, чтение, постраничный обход, отмена и перенос.
 
 Сборка и валидация тела запроса общая для синхронного и асинхронного
 клиентов (`build_send_payload`), различается только способ сделать HTTP-вызов.
 
-Об идемпотентности. `POST /emails` принимает `Idempotency-Key`, и SDK ставит
-его сам: ключ генерируется один раз на вызов и переиспользуется всеми
-повторами внутри этого вызова. Поэтому сетевой сбой или `503` не превращаются
-в два письма. Повторный вызов `send()` — это новый ключ и новое письмо, как и
-ожидает вызывающий. Если ключа нет (`auto_idempotency=False`), запрос
-помечается неидемпотентным: дедуплицировать повтор бэкенду нечем.
-`POST /emails/batch` заголовок не принимает (бэкенд коммитит письма батча по
-одному), поэтому он неидемпотентен всегда и повторяется только на `429` —
-единственном отказе, который случается до приёма писем.
+Об идемпотентности. `POST /emails` и `POST /emails/batch` принимают
+`Idempotency-Key`, и SDK ставит его сам: ключ генерируется один раз на вызов и
+переиспользуется всеми повторами внутри этого вызова. Поэтому сетевой сбой или
+`503` не превращаются в два письма. Повторный вызов `send()` — это новый ключ и
+новое письмо, как и ожидает вызывающий. У батча бэкенд выводит из ключа запроса
+отдельный ключ для каждого письма: повтор не дублирует уже принятые письма, а
+отклонённые пробует принять заново. Если ключа нет (`auto_idempotency=False`),
+запрос помечается неидемпотентным: дедуплицировать повтор бэкенду нечем, и
+повторяется только `429` — единственный отказ, который случается до приёма
+писем.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from __future__ import annotations
 import base64
 import builtins
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import quote
@@ -29,15 +30,18 @@ from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
 from .._errors import MailInfraError
+from .._validation import RescheduleRequest, SendRequest, dump_validated, field_errors
 from ..models import (
     Attachment,
     BatchSendResponseData,
     EmailDetail,
     EmailEventPublic,
     EmailListItem,
-    EmailSendRequest,
+    EmailListResponse,
+    EmailScheduleData,
     EmailSendResponseData,
     EmailStatus,
+    SendBatchResult,
     SendEmailResult,
 )
 
@@ -55,11 +59,19 @@ IDEMPOTENT_REPLAYED_HEADER = "Idempotent-Replayed"
 # с 422 — ловим это на клиенте, чтобы не тратить запрос.
 IDEMPOTENCY_KEY_MAX_LENGTH = 255
 
+# Ключ батча короче на 3 символа: бэкенд дописывает к нему разделитель и номер
+# письма (`\x1f0` … `\x1f99`), а ключ письма ограничен теми же 255 символами.
+BATCH_IDEMPOTENCY_KEY_MAX_LENGTH = 252
+
 # `BatchSendRequest.emails` в спеке ограничен `maxItems: 100`.
 MAX_BATCH_SIZE = 100
 
 _EMAILS_PATH = "/emails"
 _BATCH_PATH = "/emails/batch"
+_REQUEST_ID_HEADER = "X-Request-ID"
+
+_SEND_REJECTED = "Письмо не прошло клиентскую валидацию"
+_RESCHEDULE_REJECTED = "Новое время отправки не прошло клиентскую валидацию"
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -95,11 +107,7 @@ def _parse_response(
     try:
         return model.model_validate(data)
     except PydanticValidationError as exc:
-        fields = [
-            {"field": ".".join(str(part) for part in error["loc"]), "message": error["msg"]}
-            for error in exc.errors()
-        ]
-        summary = "; ".join(f"{item['field']}: {item['message']}" for item in fields)
+        fields, summary = field_errors(exc)
         raise MailInfraError(
             f"Ответ API не совпал с моделью {model.__name__} — обновите SDK ({summary})",
             status_code=status_code,
@@ -113,7 +121,58 @@ def _response_meta(response: httpx.Response) -> dict[str, Any]:
     """`status_code` и `request_id` ответа — для ошибки `malformed_response`."""
     return {
         "status_code": response.status_code,
-        "request_id": response.headers.get("X-Request-ID"),
+        "request_id": response.headers.get(_REQUEST_ID_HEADER),
+    }
+
+
+def _parse_accepted(
+    model: type[_ModelT],
+    data: Any,
+    response: httpx.Response,
+    idempotency_key: str | None,
+) -> _ModelT:
+    """Разбирает ответ на отправку, после которой письма уже приняты.
+
+    Неразобранный `202` не значит «не отправлено»: повтор с новым ключом
+    создал бы дубли. Поэтому ключ — в деталях ошибки, чтобы повторить вызов
+    с ним же, а `request_id` — для поддержки.
+
+    Args:
+        model: Модель поля `data` ответа.
+        data: Поле `data` ответа.
+        response: Ответ httpx.
+        idempotency_key: Ключ, с которым ушёл запрос.
+
+    Returns:
+        Экземпляр модели.
+
+    Raises:
+        MailInfraError: Ответ не совпал с моделью.
+    """
+    return _parse_response(
+        model,
+        data,
+        **_response_meta(response),
+        details={"idempotency_key": idempotency_key} if idempotency_key else None,
+    )
+
+
+def _acceptance_meta(response: httpx.Response, idempotency_key: str | None) -> dict[str, Any]:
+    """Метаданные приёма для `SendEmailResult` и `SendBatchResult`.
+
+    Args:
+        response: Ответ на отправку.
+        idempotency_key: Ключ, с которым ушёл запрос.
+
+    Returns:
+        `replayed`, `idempotency_key` и `request_id` — аргументы `from_response`.
+    """
+    replayed_header = response.headers.get(IDEMPOTENT_REPLAYED_HEADER) or ""
+    return {
+        # Первый приём — `202`, повтор — `200` с `Idempotent-Replayed: true`.
+        "replayed": response.status_code == 200 or replayed_header.lower() == "true",
+        "idempotency_key": idempotency_key,
+        "request_id": response.headers.get(_REQUEST_ID_HEADER),
     }
 
 
@@ -150,6 +209,29 @@ def _parse_list(
         _parse_response(model, item, status_code=status_code, request_id=request_id)
         for item in data
     ]
+
+
+def _next_cursor(page: EmailListResponse) -> str | None:
+    """Курсор страницы, которая идёт после `page`.
+
+    Args:
+        page: Полученная страница писем.
+
+    Returns:
+        `next_cursor` или `None`, если страниц больше нет.
+
+    Raises:
+        MailInfraError: `has_more` без `next_cursor`: запросить следующую
+            страницу нечем, а молча оборвать обход значило бы потерять письма.
+    """
+    if not page.has_more:
+        return None
+    if not page.next_cursor:
+        raise MailInfraError(
+            "Ответ API не по контракту: has_more=true без next_cursor — обновите SDK",
+            code="malformed_response",
+        )
+    return page.next_cursor
 
 
 def _email_path(email_id: str | UUID, suffix: str = "") -> str:
@@ -192,7 +274,8 @@ def _attachment_payload(item: Attachment | Mapping[str, Any]) -> dict[str, Any]:
 
     Args:
         item: `Attachment` (SDK сам закодирует байты) либо готовый словарь
-            с `filename` и `content_base64`.
+            с `filename` и `content_base64` (и, для inline-картинки,
+            `content_id`).
 
     Returns:
         Словарь для поля `attachments`.
@@ -208,6 +291,7 @@ def _attachment_payload(item: Attachment | Mapping[str, Any]) -> dict[str, Any]:
             "filename": item.filename,
             "content_base64": content_base64,
             "content_type": item.content_type,
+            "content_id": item.content_id,
         }
 
     payload = dict(item)
@@ -234,17 +318,18 @@ def build_send_payload(
     reply_to: str | Sequence[str] | None = None,
     headers: Mapping[str, str] | None = None,
     tags: Sequence[str] | None = None,
+    metadata: Mapping[str, str] | None = None,
     template: str | None = None,
     variables: Mapping[str, Any] | None = None,
     attachments: Sequence[Attachment | Mapping[str, Any]] | None = None,
+    send_at: datetime | str | None = None,
+    ttl: int | None = None,
 ) -> dict[str, Any]:
     """Собирает и валидирует тело запроса на отправку.
 
-    Валидация идёт через сгенерированную из OpenAPI модель
-    `EmailSendRequest`: лимиты (50 получателей, 10 тегов, 998 символов в
-    subject, размер вложения) проверяются до сетевого вызова — быстрее и
-    понятнее, чем `422` от API. Ошибка приходит как `MailInfraError` с
-    кодом `invalid_request`, а разбор по полям лежит в `details["fields"]`.
+    Лимиты спеки (получатели, теги, тема, вложения, диапазон `ttl`) и те, что
+    в спеке не записаны (`metadata`, часовой пояс у `send_at`), проверяются до
+    сетевого вызова — быстрее и понятнее, чем `422` от API.
 
     Args:
         from_email: Адрес отправителя на подтверждённом домене.
@@ -258,13 +343,24 @@ def build_send_payload(
         reply_to: Адреса для ответа.
         headers: Дополнительные заголовки письма (системные запрещены).
         tags: Теги для фильтрации в дашборде и вебхуках.
+        metadata: Ваши пары «ключ — значение»: до 20 ключей `[A-Za-z0-9_.-]`
+            до 40 символов, значения до 500 символов, всё — до 4096 байт
+            JSON. Вернутся в `get()`, `list()` и в вебхуках письма.
         template: Слаг шаблона вместо html/text.
         variables: Переменные шаблона.
-        attachments: Вложения.
+        attachments: Вложения; с `content_id` — inline-картинки.
+        send_at: Отложенная отправка: `datetime` с часовым поясом или ISO 8601
+            строка со смещением, до 7 дней вперёд; прошедшее — сразу.
+        ttl: Срок жизни письма в секундах, 60..86400, от `send_at` или от
+            приёма; не доставленное за это время письмо не отправляется.
 
     Returns:
         Готовое JSON-тело запроса с алиасами полей API (`from`, а не
         `from_email`) и без пустых значений.
+
+    Raises:
+        MailInfraError: Письмо не прошло проверку: `code="invalid_request"`,
+            разбор по полям — в `details["fields"]`.
     """
     raw: dict[str, Any] = {
         "from": from_email,
@@ -278,38 +374,35 @@ def build_send_payload(
         "text": text,
         "headers": dict(headers) if headers else None,
         "tags": list(tags) if tags else None,
+        "metadata": dict(metadata) if metadata else None,
         "template": template,
         "variables": dict(variables) if variables else None,
         "attachments": (
             [_attachment_payload(item) for item in attachments] if attachments else None
         ),
+        "send_at": send_at,
+        "ttl": ttl,
     }
     payload = {key: value for key, value in raw.items() if value is not None}
+    return dump_validated(SendRequest, payload, failure_message=_SEND_REJECTED)
 
-    # Валидация по спеке. `exclude_none` в дампе нужен, чтобы не отправлять
-    # `"html": null` — бэкенд это примет, но шум в логах ни к чему.
-    try:
-        model = EmailSendRequest.model_validate(payload)
-    except PydanticValidationError as exc:
-        # README учит ловить `MailInfraError`, и голый `ValidationError`
-        # пролетал бы мимо такого except — ровно та же дыра, что уже закрыта
-        # в `webhooks.construct_event`. Go и PHP отдают здесь свой
-        # `invalid_request`, и без обёртки четыре SDK на одном и том же
-        # письме требуют разных except.
-        fields = [
-            {
-                "field": ".".join(str(part) for part in error["loc"]),
-                "message": error["msg"],
-            }
-            for error in exc.errors()
-        ]
-        summary = "; ".join(f"{item['field']}: {item['message']}" for item in fields)
-        raise MailInfraError(
-            f"Письмо не прошло клиентскую валидацию — {summary}",
-            code="invalid_request",
-            details={"fields": fields},
-        ) from exc
-    return model.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+def _reschedule_payload(send_at: datetime | str) -> dict[str, Any]:
+    """Собирает и валидирует тело переноса письма.
+
+    Args:
+        send_at: Новое время отправки.
+
+    Returns:
+        JSON-тело для `PATCH /emails/{email_id}`.
+
+    Raises:
+        MailInfraError: У `send_at` нет часового пояса или он не разобран
+            (`code="invalid_request"`).
+    """
+    return dump_validated(
+        RescheduleRequest, {"send_at": send_at}, failure_message=_RESCHEDULE_REJECTED
+    )
 
 
 def _list_params(
@@ -321,6 +414,7 @@ def _list_params(
     from_date: datetime | str | None,
     to_date: datetime | str | None,
     limit: int | None,
+    cursor: str | None,
 ) -> dict[str, Any]:
     """Собирает query-параметры для списка писем.
 
@@ -335,7 +429,8 @@ def _list_params(
         from_date: Начало интервала по `created_at`. Наивный `datetime`
             трактуется как локальное время и переводится в UTC.
         to_date: Конец интервала по `created_at`; та же трактовка времени.
-        limit: Размер выборки (1..100).
+        limit: Размер страницы (1..100).
+        cursor: `next_cursor` предыдущей страницы.
 
     Returns:
         Словарь query-параметров без пустых значений.
@@ -361,6 +456,7 @@ def _list_params(
         "from": _moment(from_date),
         "to": _moment(to_date),
         "limit": limit,
+        "cursor": cursor,
     }
     return {key: value for key, value in raw.items() if value is not None}
 
@@ -369,17 +465,18 @@ class _EmailsResourceBase:
     """Общая логика ресурса писем без сетевых вызовов."""
 
     def _idempotency_headers(
-        self, idempotency_key: str | None, *, auto_idempotency: bool
+        self, idempotency_key: str | None, *, auto_idempotency: bool, max_length: int
     ) -> tuple[dict[str, str], str | None]:
         """Готовит заголовок идемпотентности для отправки.
 
         Args:
             idempotency_key: Ключ от вызывающего; `None` — сгенерировать.
             auto_idempotency: Включена ли авто-генерация у клиента.
+            max_length: Предел длины ключа у эндпоинта (у батча он короче).
 
         Returns:
             Пара «заголовки, использованный ключ». Ключ возвращается, чтобы
-            попасть в `SendEmailResult` и в логи вызывающего.
+            попасть в результат отправки и в логи вызывающего.
 
         Raises:
             MailInfraError: Если переданный ключ пуст или длиннее лимита API.
@@ -419,10 +516,9 @@ class _EmailsResourceBase:
 
         # Ошибка того же класса, что и остальные: README учит ловить
         # `MailInfraError`, и ValueError пролетал бы мимо такого except.
-        if len(idempotency_key) > IDEMPOTENCY_KEY_MAX_LENGTH:
+        if len(idempotency_key) > max_length:
             raise MailInfraError(
-                f"Idempotency-Key длиннее {IDEMPOTENCY_KEY_MAX_LENGTH} символов — "
-                "API отклонит такой запрос с 422",
+                f"Idempotency-Key длиннее {max_length} символов — API отклонит такой запрос с 422",
                 code="invalid_idempotency_key",
             )
 
@@ -430,41 +526,37 @@ class _EmailsResourceBase:
 
     @staticmethod
     def _send_result(
-        data: Any,
-        *,
-        status_code: int,
-        replayed_header: str | None,
-        request_id: str | None,
-        idempotency_key: str | None,
+        data: Any, response: httpx.Response, idempotency_key: str | None
     ) -> SendEmailResult:
-        """Собирает результат отправки из ответа API.
+        """Собирает результат отправки письма из ответа API.
 
         Args:
             data: Поле `data` ответа.
-            status_code: HTTP-статус: `202` — принято, `200` — повтор.
-            replayed_header: Значение заголовка `Idempotent-Replayed`.
-            request_id: Значение заголовка `X-Request-ID`.
+            response: Ответ httpx: статус и заголовки повтора.
             idempotency_key: Ключ, с которым ушёл запрос.
 
         Returns:
             Результат отправки.
         """
-        replayed = status_code == 200 or (replayed_header or "").lower() == "true"
-        # Письмо уже принято, но ответ не разобран: ключ в деталях ошибки, чтобы
-        # повторить send() с ним же, а не получить дубль с новым ключом.
-        parsed = _parse_response(
-            EmailSendResponseData,
-            data,
-            status_code=status_code,
-            request_id=request_id,
-            details={"idempotency_key": idempotency_key} if idempotency_key else None,
-        )
-        return SendEmailResult.from_response(
-            parsed,
-            replayed=replayed,
-            idempotency_key=idempotency_key,
-            request_id=request_id,
-        )
+        parsed = _parse_accepted(EmailSendResponseData, data, response, idempotency_key)
+        return SendEmailResult.from_response(parsed, **_acceptance_meta(response, idempotency_key))
+
+    @staticmethod
+    def _batch_result(
+        data: Any, response: httpx.Response, idempotency_key: str | None
+    ) -> SendBatchResult:
+        """Собирает результат батча из ответа API.
+
+        Args:
+            data: Поле `data` ответа.
+            response: Ответ httpx: статус и заголовки повтора.
+            idempotency_key: Ключ, с которым ушёл запрос.
+
+        Returns:
+            Результат батча.
+        """
+        parsed = _parse_accepted(BatchSendResponseData, data, response, idempotency_key)
+        return SendBatchResult.from_response(parsed, **_acceptance_meta(response, idempotency_key))
 
     @staticmethod
     def _batch_payload(
@@ -500,14 +592,14 @@ class _EmailsResourceBase:
         for index, item in enumerate(emails):
             fields = dict(item)
             # Документация описывает элементы батча как «наборы параметров, как
-            # у send()», а `send()` принимает `idempotency_key`. Эндпоинт батча
-            # заголовок не принимает вовсе, и тихо выбросить ключ нельзя: он
-            # ровно для защиты от дублей и добавлен.
+            # у send()», а `send()` принимает `idempotency_key`. У батча ключ
+            # один на весь запрос, и тихо выбросить ключ письма нельзя: он ровно
+            # для защиты от дублей и добавлен.
             if "idempotency_key" in fields:
                 raise MailInfraError(
-                    f"Письмо #{index} в батче задаёт idempotency_key, а "
-                    "POST /emails/batch этот заголовок не принимает — бэкенд коммитит письма "
-                    "батча по одному. Отправляйте такие письма через send().",
+                    f"Письмо #{index} в батче задаёт idempotency_key, а у батча ключ один на "
+                    "весь запрос: передайте его как send_batch(..., idempotency_key=...) — "
+                    "бэкенд выведет из него ключ каждого письма.",
                     code="invalid_batch_item",
                 )
             try:
@@ -545,9 +637,12 @@ class EmailsResource(_EmailsResourceBase):
         reply_to: str | Sequence[str] | None = None,
         headers: Mapping[str, str] | None = None,
         tags: Sequence[str] | None = None,
+        metadata: Mapping[str, str] | None = None,
         template: str | None = None,
         variables: Mapping[str, Any] | None = None,
         attachments: Sequence[Attachment | Mapping[str, Any]] | None = None,
+        send_at: datetime | str | None = None,
+        ttl: int | None = None,
         idempotency_key: str | None = None,
     ) -> SendEmailResult:
         """Отправляет письмо.
@@ -564,9 +659,14 @@ class EmailsResource(_EmailsResourceBase):
             reply_to: Адреса для ответа.
             headers: Дополнительные заголовки письма.
             tags: Теги.
+            metadata: Ваши пары «ключ — значение»; лимиты — в
+                `build_send_payload`.
             template: Слаг шаблона.
             variables: Переменные шаблона.
-            attachments: Вложения.
+            attachments: Вложения; с `content_id` — inline-картинки.
+            send_at: Время отложенной отправки с часовым поясом, не дальше
+                7 дней вперёд; письмо получит статус `SCHEDULED`.
+            ttl: Срок жизни письма в секундах, 60..86400.
             idempotency_key: Свой ключ идемпотентности; по умолчанию SDK
                 генерирует `uuid4` на каждый вызов.
 
@@ -591,57 +691,49 @@ class EmailsResource(_EmailsResourceBase):
             reply_to=reply_to,
             headers=headers,
             tags=tags,
+            metadata=metadata,
             template=template,
             variables=variables,
             attachments=attachments,
+            send_at=send_at,
+            ttl=ttl,
         )
-        request_headers, used_key = self._idempotency_headers(
-            idempotency_key, auto_idempotency=self._client.auto_idempotency
+        data, response, used_key = self._post_with_key(
+            _EMAILS_PATH, payload, idempotency_key, max_key_length=IDEMPOTENCY_KEY_MAX_LENGTH
         )
+        return self._send_result(data, response, used_key)
 
-        # Без `Idempotency-Key` бэкенду нечем распознать повтор
-        # (`email_service.send_email` дедуплицирует только по ключу), поэтому
-        # такой запрос неидемпотентен: повтор после `5xx` создал бы второе письмо.
-        data, response = self._client.request_with_response(
-            "POST",
-            _EMAILS_PATH,
-            json=payload,
-            headers=request_headers,
-            idempotent=used_key is not None,
-        )
-        return self._send_result(
-            data,
-            status_code=response.status_code,
-            replayed_header=response.headers.get(IDEMPOTENT_REPLAYED_HEADER),
-            request_id=response.headers.get("X-Request-ID"),
-            idempotency_key=used_key,
-        )
-
-    def send_batch(self, emails: Sequence[Mapping[str, Any]]) -> BatchSendResponseData:
+    def send_batch(
+        self, emails: Sequence[Mapping[str, Any]], *, idempotency_key: str | None = None
+    ) -> SendBatchResult:
         """Отправляет до 100 писем одним запросом.
 
         Батч возвращает `202` даже если часть писем не принята: проверяйте
         `error` у каждого элемента `results`, а не только статус ответа.
-        `Idempotency-Key` этот эндпоинт не поддерживает, поэтому SDK не
-        повторяет его после `5xx`, таймаута и обрыва соединения — повтор мог
-        бы отправить часть писем дважды. Повторяется только `429`.
+        `Idempotency-Key` SDK ставит сам и переиспользует его на повторах:
+        бэкенд выводит из него ключ каждого письма, поэтому повтор после
+        `5xx` или таймаута не дублирует уже принятые письма, а отклонённые
+        пробует принять заново. Без ключа (`auto_idempotency=False`) батч
+        повторяется только на `429`.
 
         Args:
-            emails: Список наборов параметров, как у `send()`.
+            emails: Список наборов параметров, как у `send()`, но без
+                `idempotency_key` — он у батча один на запрос.
+            idempotency_key: Свой ключ батча, до 252 символов; по умолчанию
+                SDK генерирует `uuid4` на каждый вызов.
 
         Returns:
-            Результаты по каждому письму и счётчики принятых/отклонённых.
+            Результаты по каждому письму, счётчики принятых/отклонённых,
+            флаг `replayed` и использованный ключ.
 
         Raises:
-            MailInfraError: Ошибка API или транспорта.
+            MailInfraError: Ошибка API, транспорта или клиентской валидации.
         """
         payload = self._batch_payload(emails)
-        # Письма батча уже приняты, а ключа идемпотентности у батча нет: повтор
-        # создал бы дубли — в ошибке разбора нужен request_id для поддержки.
-        data, response = self._client.request_with_response(
-            "POST", _BATCH_PATH, json=payload, idempotent=False
+        data, response, used_key = self._post_with_key(
+            _BATCH_PATH, payload, idempotency_key, max_key_length=BATCH_IDEMPOTENCY_KEY_MAX_LENGTH
         )
-        return _parse_response(BatchSendResponseData, data, **_response_meta(response))
+        return self._batch_result(data, response, used_key)
 
     def get(self, email_id: str | UUID) -> EmailDetail:
         """Возвращает письмо с телом, заголовками и диагностикой доставки.
@@ -668,8 +760,11 @@ class EmailsResource(_EmailsResourceBase):
         from_date: datetime | str | None = None,
         to_date: datetime | str | None = None,
         limit: int | None = None,
-    ) -> builtins.list[EmailListItem]:
-        """Возвращает письма проекта по фильтрам.
+        cursor: str | None = None,
+    ) -> EmailListResponse:
+        """Возвращает одну страницу писем проекта по фильтрам, новые сначала.
+
+        Обойти все страницы проще через `list_all()`.
 
         Args:
             status: Фильтр по статусу.
@@ -678,10 +773,13 @@ class EmailsResource(_EmailsResourceBase):
             tag: Фильтр по тегу.
             from_date: Начало интервала по времени создания.
             to_date: Конец интервала.
-            limit: Размер выборки, 1..100 (по умолчанию 25 на стороне API).
+            limit: Размер страницы, 1..100 (по умолчанию 25 на стороне API).
+            cursor: `next_cursor` предыдущей страницы; фильтры передавайте
+                те же. Без курсора — первая страница.
 
         Returns:
-            Список писем в сокращённом виде.
+            Страница: письма в сокращённом виде (`data`), есть ли ещё
+            (`has_more`) и курсор следующей страницы (`next_cursor`).
         """
         params = _list_params(
             status=status,
@@ -691,9 +789,61 @@ class EmailsResource(_EmailsResourceBase):
             from_date=from_date,
             to_date=to_date,
             limit=limit,
+            cursor=cursor,
         )
-        data, response = self._client.request_with_response("GET", _EMAILS_PATH, params=params)
-        return _parse_list(EmailListItem, data, **_response_meta(response))
+        return self._page(params)
+
+    def list_all(
+        self,
+        *,
+        status: EmailStatus | str | None = None,
+        from_email: str | None = None,
+        to_email: str | None = None,
+        tag: str | None = None,
+        from_date: datetime | str | None = None,
+        to_date: datetime | str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> Iterator[EmailListItem]:
+        """Обходит все письма по фильтрам, сам запрашивая страницы.
+
+        Следующая страница запрашивается, только когда предыдущая выбрана до
+        конца: прерванный цикл лишних запросов не делает.
+
+        Args:
+            status: Фильтр по статусу.
+            from_email: Фильтр по отправителю.
+            to_email: Фильтр по получателю.
+            tag: Фильтр по тегу.
+            from_date: Начало интервала по времени создания.
+            to_date: Конец интервала.
+            limit: Размер одной страницы, 1..100, а не общее число писем.
+            cursor: С какой страницы начать — сохранённый ранее
+                `next_cursor`; по умолчанию с самых новых писем.
+
+        Yields:
+            Письма в сокращённом виде, новые сначала.
+
+        Raises:
+            MailInfraError: Ошибка API на любой из страниц.
+        """
+        params = _list_params(
+            status=status,
+            from_email=from_email,
+            to_email=to_email,
+            tag=tag,
+            from_date=from_date,
+            to_date=to_date,
+            limit=limit,
+            cursor=cursor,
+        )
+        while True:
+            page = self._page(params)
+            yield from page.data
+            next_cursor = _next_cursor(page)
+            if next_cursor is None:
+                return
+            params = {**params, "cursor": next_cursor}
 
     def events(self, email_id: str | UUID) -> builtins.list[EmailEventPublic]:
         """Возвращает события письма в хронологическом порядке.
@@ -702,10 +852,105 @@ class EmailsResource(_EmailsResourceBase):
             email_id: Идентификатор письма.
 
         Returns:
-            Список событий (`queued`, `sent`, `delivered`, `bounced`, …).
+            Список событий (`scheduled`, `queued`, `sent`, `delivered`, …).
         """
         data, response = self._client.request_with_response("GET", _email_path(email_id, "/events"))
         return _parse_list(EmailEventPublic, data, **_response_meta(response))
+
+    def cancel(self, email_id: str | UUID) -> EmailScheduleData:
+        """Отменяет запланированное письмо; резерв месячной квоты возвращается.
+
+        Нужно право на отправку (`FULL_ACCESS` или `SENDING_ONLY`).
+
+        Args:
+            email_id: Идентификатор письма в статусе `SCHEDULED`.
+
+        Returns:
+            Состояние письма: `status` — `CANCELED`.
+
+        Raises:
+            EmailNotScheduledError: Письмо уже не запланировано: ушло в
+                очередь, отправлено или отменено (статус — в
+                `details["status"]`). На повторе после таймаута это значит,
+                что первая попытка письмо уже отменила.
+            NotFoundError: Письма нет или оно принадлежит другому проекту.
+        """
+        data, response = self._client.request_with_response(
+            "POST", _email_path(email_id, "/cancel")
+        )
+        return _parse_response(EmailScheduleData, data, **_response_meta(response))
+
+    def reschedule(self, email_id: str | UUID, *, send_at: datetime | str) -> EmailScheduleData:
+        """Переносит запланированное письмо на новое время.
+
+        Нужно право на отправку (`FULL_ACCESS` или `SENDING_ONLY`).
+
+        Args:
+            email_id: Идентификатор письма в статусе `SCHEDULED`.
+            send_at: Новое время: `datetime` с часовым поясом или ISO 8601
+                строка со смещением, не дальше 7 дней от приёма письма (а не
+                от переноса). Время в прошлом — отправить сейчас.
+
+        Returns:
+            Состояние письма с новым `scheduled_at`.
+
+        Raises:
+            MailInfraError: У `send_at` нет часового пояса — до сетевого
+                вызова, `code="invalid_request"`.
+            SendAtTooFarError: Новое время дальше горизонта.
+            EmailNotScheduledError: Письмо уже не запланировано.
+            NotFoundError: Письма нет или оно принадлежит другому проекту.
+        """
+        data, response = self._client.request_with_response(
+            "PATCH", _email_path(email_id), json=_reschedule_payload(send_at)
+        )
+        return _parse_response(EmailScheduleData, data, **_response_meta(response))
+
+    def _page(self, params: dict[str, Any]) -> EmailListResponse:
+        """Запрашивает одну страницу писем.
+
+        Args:
+            params: Query-параметры из `_list_params`.
+
+        Returns:
+            Страница писем.
+        """
+        body, response = self._client.request_with_response(
+            "GET", _EMAILS_PATH, params=params, envelope=True
+        )
+        return _parse_response(EmailListResponse, body, **_response_meta(response))
+
+    def _post_with_key(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        idempotency_key: str | None,
+        *,
+        max_key_length: int,
+    ) -> tuple[Any, httpx.Response, str | None]:
+        """Отправляет письма с ключом идемпотентности.
+
+        Args:
+            path: `/emails` или `/emails/batch`.
+            payload: Готовое JSON-тело.
+            idempotency_key: Ключ от вызывающего; `None` — по настройке клиента.
+            max_key_length: Предел длины ключа у эндпоинта.
+
+        Returns:
+            Поле `data` ответа, сам ответ и использованный ключ.
+        """
+        request_headers, used_key = self._idempotency_headers(
+            idempotency_key,
+            auto_idempotency=self._client.auto_idempotency,
+            max_length=max_key_length,
+        )
+        # Без `Idempotency-Key` бэкенду нечем распознать повтор
+        # (`email_service.send_email` дедуплицирует только по ключу), поэтому
+        # такой запрос неидемпотентен: повтор после `5xx` создал бы дубли.
+        data, response = self._client.request_with_response(
+            "POST", path, json=payload, headers=request_headers, idempotent=used_key is not None
+        )
+        return data, response, used_key
 
 
 class AsyncEmailsResource(_EmailsResourceBase):
@@ -731,9 +976,12 @@ class AsyncEmailsResource(_EmailsResourceBase):
         reply_to: str | Sequence[str] | None = None,
         headers: Mapping[str, str] | None = None,
         tags: Sequence[str] | None = None,
+        metadata: Mapping[str, str] | None = None,
         template: str | None = None,
         variables: Mapping[str, Any] | None = None,
         attachments: Sequence[Attachment | Mapping[str, Any]] | None = None,
+        send_at: datetime | str | None = None,
+        ttl: int | None = None,
         idempotency_key: str | None = None,
     ) -> SendEmailResult:
         """Отправляет письмо.
@@ -750,9 +998,12 @@ class AsyncEmailsResource(_EmailsResourceBase):
             reply_to: Адреса для ответа.
             headers: Дополнительные заголовки письма.
             tags: Теги.
+            metadata: Ваши пары «ключ — значение».
             template: Слаг шаблона.
             variables: Переменные шаблона.
-            attachments: Вложения.
+            attachments: Вложения; с `content_id` — inline-картинки.
+            send_at: Время отложенной отправки с часовым поясом.
+            ttl: Срок жизни письма в секундах, 60..86400.
             idempotency_key: Свой ключ идемпотентности.
 
         Returns:
@@ -773,48 +1024,38 @@ class AsyncEmailsResource(_EmailsResourceBase):
             reply_to=reply_to,
             headers=headers,
             tags=tags,
+            metadata=metadata,
             template=template,
             variables=variables,
             attachments=attachments,
+            send_at=send_at,
+            ttl=ttl,
         )
-        request_headers, used_key = self._idempotency_headers(
-            idempotency_key, auto_idempotency=self._client.auto_idempotency
+        data, response, used_key = await self._post_with_key(
+            _EMAILS_PATH, payload, idempotency_key, max_key_length=IDEMPOTENCY_KEY_MAX_LENGTH
         )
+        return self._send_result(data, response, used_key)
 
-        data, response = await self._client.request_with_response(
-            "POST",
-            _EMAILS_PATH,
-            json=payload,
-            headers=request_headers,
-            idempotent=used_key is not None,
-        )
-        return self._send_result(
-            data,
-            status_code=response.status_code,
-            replayed_header=response.headers.get(IDEMPOTENT_REPLAYED_HEADER),
-            request_id=response.headers.get("X-Request-ID"),
-            idempotency_key=used_key,
-        )
-
-    async def send_batch(self, emails: Sequence[Mapping[str, Any]]) -> BatchSendResponseData:
+    async def send_batch(
+        self, emails: Sequence[Mapping[str, Any]], *, idempotency_key: str | None = None
+    ) -> SendBatchResult:
         """Отправляет до 100 писем одним запросом.
 
         Args:
             emails: Список наборов параметров, как у `send()`.
+            idempotency_key: Свой ключ батча, до 252 символов.
 
         Returns:
-            Результаты по каждому письму и счётчики.
+            Результаты по каждому письму, счётчики и флаг `replayed`.
 
         Raises:
             MailInfraError: Ошибка API или транспорта.
         """
         payload = self._batch_payload(emails)
-        # Письма батча уже приняты, а ключа идемпотентности у батча нет: повтор
-        # создал бы дубли — в ошибке разбора нужен request_id для поддержки.
-        data, response = await self._client.request_with_response(
-            "POST", _BATCH_PATH, json=payload, idempotent=False
+        data, response, used_key = await self._post_with_key(
+            _BATCH_PATH, payload, idempotency_key, max_key_length=BATCH_IDEMPOTENCY_KEY_MAX_LENGTH
         )
-        return _parse_response(BatchSendResponseData, data, **_response_meta(response))
+        return self._batch_result(data, response, used_key)
 
     async def get(self, email_id: str | UUID) -> EmailDetail:
         """Возвращает письмо с телом, заголовками и диагностикой доставки.
@@ -838,8 +1079,9 @@ class AsyncEmailsResource(_EmailsResourceBase):
         from_date: datetime | str | None = None,
         to_date: datetime | str | None = None,
         limit: int | None = None,
-    ) -> builtins.list[EmailListItem]:
-        """Возвращает письма проекта по фильтрам.
+        cursor: str | None = None,
+    ) -> EmailListResponse:
+        """Возвращает одну страницу писем проекта по фильтрам.
 
         Args:
             status: Фильтр по статусу.
@@ -848,10 +1090,11 @@ class AsyncEmailsResource(_EmailsResourceBase):
             tag: Фильтр по тегу.
             from_date: Начало интервала.
             to_date: Конец интервала.
-            limit: Размер выборки, 1..100.
+            limit: Размер страницы, 1..100.
+            cursor: `next_cursor` предыдущей страницы.
 
         Returns:
-            Список писем в сокращённом виде.
+            Страница с `data`, `has_more` и `next_cursor`.
         """
         params = _list_params(
             status=status,
@@ -861,11 +1104,58 @@ class AsyncEmailsResource(_EmailsResourceBase):
             from_date=from_date,
             to_date=to_date,
             limit=limit,
+            cursor=cursor,
         )
-        data, response = await self._client.request_with_response(
-            "GET", _EMAILS_PATH, params=params
+        return await self._page(params)
+
+    async def list_all(
+        self,
+        *,
+        status: EmailStatus | str | None = None,
+        from_email: str | None = None,
+        to_email: str | None = None,
+        tag: str | None = None,
+        from_date: datetime | str | None = None,
+        to_date: datetime | str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> AsyncIterator[EmailListItem]:
+        """Обходит все письма по фильтрам (`async for`), сам запрашивая страницы.
+
+        Args:
+            status: Фильтр по статусу.
+            from_email: Фильтр по отправителю.
+            to_email: Фильтр по получателю.
+            tag: Фильтр по тегу.
+            from_date: Начало интервала.
+            to_date: Конец интервала.
+            limit: Размер одной страницы, 1..100.
+            cursor: С какой страницы начать.
+
+        Yields:
+            Письма в сокращённом виде, новые сначала.
+
+        Raises:
+            MailInfraError: Ошибка API на любой из страниц.
+        """
+        params = _list_params(
+            status=status,
+            from_email=from_email,
+            to_email=to_email,
+            tag=tag,
+            from_date=from_date,
+            to_date=to_date,
+            limit=limit,
+            cursor=cursor,
         )
-        return _parse_list(EmailListItem, data, **_response_meta(response))
+        while True:
+            page = await self._page(params)
+            for item in page.data:
+                yield item
+            next_cursor = _next_cursor(page)
+            if next_cursor is None:
+                return
+            params = {**params, "cursor": next_cursor}
 
     async def events(self, email_id: str | UUID) -> builtins.list[EmailEventPublic]:
         """Возвращает события письма в хронологическом порядке.
@@ -880,3 +1170,83 @@ class AsyncEmailsResource(_EmailsResourceBase):
             "GET", _email_path(email_id, "/events")
         )
         return _parse_list(EmailEventPublic, data, **_response_meta(response))
+
+    async def cancel(self, email_id: str | UUID) -> EmailScheduleData:
+        """Отменяет запланированное письмо.
+
+        Args:
+            email_id: Идентификатор письма в статусе `SCHEDULED`.
+
+        Returns:
+            Состояние письма: `status` — `CANCELED`.
+
+        Raises:
+            EmailNotScheduledError: Письмо уже не запланировано.
+        """
+        data, response = await self._client.request_with_response(
+            "POST", _email_path(email_id, "/cancel")
+        )
+        return _parse_response(EmailScheduleData, data, **_response_meta(response))
+
+    async def reschedule(
+        self, email_id: str | UUID, *, send_at: datetime | str
+    ) -> EmailScheduleData:
+        """Переносит запланированное письмо на новое время.
+
+        Args:
+            email_id: Идентификатор письма в статусе `SCHEDULED`.
+            send_at: Новое время с часовым поясом.
+
+        Returns:
+            Состояние письма с новым `scheduled_at`.
+
+        Raises:
+            MailInfraError: Клиентская валидация или ошибка API.
+        """
+        data, response = await self._client.request_with_response(
+            "PATCH", _email_path(email_id), json=_reschedule_payload(send_at)
+        )
+        return _parse_response(EmailScheduleData, data, **_response_meta(response))
+
+    async def _page(self, params: dict[str, Any]) -> EmailListResponse:
+        """Запрашивает одну страницу писем.
+
+        Args:
+            params: Query-параметры из `_list_params`.
+
+        Returns:
+            Страница писем.
+        """
+        body, response = await self._client.request_with_response(
+            "GET", _EMAILS_PATH, params=params, envelope=True
+        )
+        return _parse_response(EmailListResponse, body, **_response_meta(response))
+
+    async def _post_with_key(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        idempotency_key: str | None,
+        *,
+        max_key_length: int,
+    ) -> tuple[Any, httpx.Response, str | None]:
+        """Отправляет письма с ключом идемпотентности.
+
+        Args:
+            path: `/emails` или `/emails/batch`.
+            payload: Готовое JSON-тело.
+            idempotency_key: Ключ от вызывающего; `None` — по настройке клиента.
+            max_key_length: Предел длины ключа у эндпоинта.
+
+        Returns:
+            Поле `data` ответа, сам ответ и использованный ключ.
+        """
+        request_headers, used_key = self._idempotency_headers(
+            idempotency_key,
+            auto_idempotency=self._client.auto_idempotency,
+            max_length=max_key_length,
+        )
+        data, response = await self._client.request_with_response(
+            "POST", path, json=payload, headers=request_headers, idempotent=used_key is not None
+        )
+        return data, response, used_key

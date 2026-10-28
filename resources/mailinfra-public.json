@@ -127,6 +127,7 @@
           "connection-error",
           "rate-limited",
           "auth-failure",
+          "delivery-expired",
           "unknown"
         ],
         "title": "BounceCategory",
@@ -164,6 +165,18 @@
         "title": "DataResponse[EmailDetail]",
         "type": "object"
       },
+      "DataResponse_EmailScheduleData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/EmailScheduleData"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "DataResponse[EmailScheduleData]",
+        "type": "object"
+      },
       "DataResponse_EmailSendResponseData_": {
         "properties": {
           "data": {
@@ -191,21 +204,6 @@
         "title": "DataResponse[list[EmailEventPublic]]",
         "type": "object"
       },
-      "DataResponse_list_EmailListItem__": {
-        "properties": {
-          "data": {
-            "items": {
-              "$ref": "#/components/schemas/EmailListItem"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "data"
-        ],
-        "title": "DataResponse[list[EmailListItem]]",
-        "type": "object"
-      },
       "DkimSigningStatus": {
         "description": "Достоверность DKIM-подписи письма.\n\n``EXPECTED`` — на нашей стороне известно, что домен верифицирован и\nключ для него существует, поэтому Haraka *должна* была подписать письмо.\nЭто не подтверждение факта подписи — Haraka сегодня не сообщает результат\nподписания обратно. ``CONFIRMED``/``FAILED`` зарезервированы под будущий\ncallback от Haraka (fast-follow), значения уже есть, миграция не нужна.",
         "enum": [
@@ -223,6 +221,14 @@
           "content_base64": {
             "maxLength": 14348938,
             "type": "string"
+          },
+          "content_id": {
+            "description": "Content-ID inline-картинки: в HTML на неё ссылаются как `cid:<content_id>`. Такое вложение встраивается в письмо, а не прикладывается файлом.",
+            "maxLength": 257,
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "content_type": {
             "default": "application/octet-stream",
@@ -335,6 +341,13 @@
               "null"
             ]
           },
+          "expires_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "failed_at": {
             "format": "date-time",
             "type": [
@@ -391,6 +404,12 @@
               "null"
             ]
           },
+          "metadata": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "project_id": {
             "format": "uuid",
             "type": "string"
@@ -406,6 +425,13 @@
               {
                 "type": "null"
               }
+            ]
+          },
+          "scheduled_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
             ]
           },
           "sent_at": {
@@ -536,6 +562,7 @@
       },
       "EmailEventType": {
         "enum": [
+          "scheduled",
           "queued",
           "sending",
           "sent",
@@ -547,7 +574,8 @@
           "complained",
           "failed",
           "simulated",
-          "deferred"
+          "deferred",
+          "canceled"
         ],
         "title": "EmailEventType",
         "type": "string"
@@ -620,6 +648,13 @@
               "null"
             ]
           },
+          "expires_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "final_smtp_code": {
             "type": [
               "integer",
@@ -651,9 +686,22 @@
               "null"
             ]
           },
+          "metadata": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "project_id": {
             "format": "uuid",
             "type": "string"
+          },
+          "scheduled_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "sent_at": {
             "format": "date-time",
@@ -728,6 +776,75 @@
         "title": "EmailListItem",
         "type": "object"
       },
+      "EmailListResponse": {
+        "description": "GET /v1/emails: страница писем проекта, новые сначала.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/EmailListItem"
+            },
+            "type": "array"
+          },
+          "has_more": {
+            "description": "Есть ли ещё письма после этой страницы.",
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "description": "Передайте в параметр `cursor`, чтобы получить следующую страницу.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "data",
+          "has_more"
+        ],
+        "title": "EmailListResponse",
+        "type": "object"
+      },
+      "EmailRescheduleRequest": {
+        "description": "PATCH /v1/emails/{id}: перенос запланированного письма.",
+        "properties": {
+          "send_at": {
+            "description": "Новое время отправки с часовым поясом, не дальше 7 дней от приёма письма. Время в прошлом — отправить сейчас.",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "send_at"
+        ],
+        "title": "EmailRescheduleRequest",
+        "type": "object"
+      },
+      "EmailScheduleData": {
+        "description": "Ответ отмены и переноса: только состояние планирования, без тела письма.",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "scheduled_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/EmailStatus"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "scheduled_at"
+        ],
+        "title": "EmailScheduleData",
+        "type": "object"
+      },
       "EmailSendRequest": {
         "description": "POST /v1/emails.",
         "properties": {
@@ -778,6 +895,13 @@
               "null"
             ]
           },
+          "metadata": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Ваши пары «ключ — значение» (номер заказа, id пользователя): вернутся в GET /v1/emails и в каждом вебхуке письма. До 20 ключей, значения — строки до 500 символов.",
+            "type": "object"
+          },
           "reply_to": {
             "items": {
               "format": "email",
@@ -785,6 +909,14 @@
             },
             "maxItems": 10,
             "type": "array"
+          },
+          "send_at": {
+            "description": "Отложенная отправка: ISO 8601 с часовым поясом, не дальше 7 дней вперёд. Письмо получит статус SCHEDULED; до отправки его можно отменить или перенести. Время в прошлом — отправить сразу.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "subject": {
             "maxLength": 998,
@@ -822,6 +954,15 @@
             "maxItems": 50,
             "minItems": 1,
             "type": "array"
+          },
+          "ttl": {
+            "description": "Срок жизни письма в секундах (от минуты до суток), отсчёт от send_at или от приёма. Не дошедшее за это время письмо не отправляется и не повторяется: статус FAILED с причиной expired или отказ с категорией delivery-expired. Для кодов входа и других писем, которые поздно уже не нужны.",
+            "maximum": 86400.0,
+            "minimum": 60.0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "variables": {
             "additionalProperties": true,
@@ -873,6 +1014,7 @@
       },
       "EmailStatus": {
         "enum": [
+          "SCHEDULED",
           "QUEUED",
           "SENDING",
           "SENT",
@@ -880,7 +1022,8 @@
           "BOUNCED",
           "COMPLAINED",
           "FAILED",
-          "SIMULATED"
+          "SIMULATED",
+          "CANCELED"
         ],
         "title": "EmailStatus",
         "type": "string"
@@ -963,6 +1106,7 @@
   "paths": {
     "/emails": {
       "get": {
+        "description": "Письма проекта, новые сначала, страницами по ``limit``.\n\nArgs:\n    ctx: Контекст API-ключа.\n    db: Сессия БД.\n    status_filter: Статус письма.\n    from_email: Адрес отправителя.\n    to_email: Адрес получателя.\n    tag: Тег письма.\n    from_date: Начало периода (включительно).\n    to_date: Конец периода.\n    limit: Размер страницы, до 100.\n    cursor: ``next_cursor`` предыдущей страницы.\n\nReturns:\n    Страница писем, признак следующей и её курсор.",
         "operationId": "list_emails",
         "parameters": [
           {
@@ -1047,6 +1191,18 @@
               "minimum": 1,
               "type": "integer"
             }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "maxLength": 200,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -1054,7 +1210,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DataResponse_list_EmailListItem__"
+                  "$ref": "#/components/schemas/EmailListResponse"
                 }
               }
             },
@@ -1216,7 +1372,22 @@
     },
     "/emails/batch": {
       "post": {
+        "description": "Принимает до ``MAX_BATCH_EMAILS`` писем одним запросом.\n\nС ``Idempotency-Key`` у каждого письма свой ключ (ключ запроса и номер\nписьма): повтор того же запроса не дублирует уже принятые письма, а\nотклонённые пробует принять заново. Если повтором оказались все\nпринятые письма, ответ — 200 с заголовком ``Idempotent-Replayed``.\n\nArgs:\n    payload: Письма batch-запроса.\n    ctx: Контекст API-ключа.\n    request: HTTP-запрос — для адреса клиента в архиве ОРИ.\n    response: HTTP-ответ — статус и заголовок повтора.\n    db: Сессия БД.\n    idempotency_key: Ключ идемпотентности batch-запроса.\n\nReturns:\n    Результат по каждому письму и счётчики.",
         "operationId": "send_batch",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 252,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1228,6 +1399,33 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_BatchSendResponseData_"
+                }
+              }
+            },
+            "description": "Идемпотентный повтор: все письма пачки с таким `Idempotency-Key` уже были приняты, ни одно не отправлено повторно; в теле — первые ответы.",
+            "headers": {
+              "Idempotent-Replayed": {
+                "description": "`true`, если это идемпотентный повтор: письмо было принято первым запросом с тем же `Idempotency-Key`, ответ отдан из сохранённого результата и повторной отправки не произошло.",
+                "schema": {
+                  "enum": [
+                    "true"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "202": {
             "content": {
               "application/json": {
@@ -1324,6 +1522,132 @@
           }
         },
         "summary": "Get Email",
+        "tags": [
+          "emails"
+        ]
+      },
+      "patch": {
+        "description": "Переносит запланированное письмо на новое время.\n\nArgs:\n    email_id: Письмо проекта ключа.\n    payload: Новое ``send_at``.\n    ctx: Контекст API-ключа.\n    db: Сессия БД.\n\nReturns:\n    Письмо с новым ``scheduled_at``.\n\nRaises:\n    ForbiddenError: Ключ не может отправлять письма.\n    NotFoundError: Письма нет в проекте.\n    ConflictError: Письмо уже не запланировано (``email_not_scheduled``).\n    ValidationError: ``send_at`` дальше горизонта (``send_at_too_far``).",
+        "operationId": "reschedule_email",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "email_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmailRescheduleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_EmailScheduleData_"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Ошибка. Единый конверт: error.code, error.message, error.details, request_id",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Reschedule Email",
+        "tags": [
+          "emails"
+        ]
+      }
+    },
+    "/emails/{email_id}/cancel": {
+      "post": {
+        "description": "Отменяет запланированное письмо; резерв квоты возвращается.\n\nПраво — то же, что на отправку: отмена — часть того же сценария\n(«пользователь оплатил — напоминание не нужно»), а ответ не раскрывает\nсодержимого письма.\n\nArgs:\n    email_id: Письмо проекта ключа.\n    ctx: Контекст API-ключа.\n    db: Сессия БД.\n\nReturns:\n    Письмо в статусе CANCELED.\n\nRaises:\n    ForbiddenError: Ключ не может отправлять письма.\n    NotFoundError: Письма нет в проекте.\n    ConflictError: Письмо уже не запланировано (``email_not_scheduled``).",
+        "operationId": "cancel_email",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "email_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_EmailScheduleData_"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Ошибка. Единый конверт: error.code, error.message, error.details, request_id",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Идентификатор запроса. Тот же id приходит в `error.request_id` и нужен для обращений в поддержку.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Cancel Email",
         "tags": [
           "emails"
         ]

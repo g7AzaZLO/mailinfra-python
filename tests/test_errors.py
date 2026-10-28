@@ -9,10 +9,13 @@ import respx
 from mailinfra import (
     AllRecipientsSuppressedError,
     AuthenticationError,
+    BadRequestError,
     ConflictError,
     DomainNotAttachedError,
     DomainNotVerifiedError,
+    EmailNotScheduledError,
     IdempotencyInFlightError,
+    IPNotAllowedError,
     LegalDocumentsNotAcceptedError,
     MailInfra,
     MailInfraError,
@@ -22,6 +25,8 @@ from mailinfra import (
     ReservedEmailHeaderError,
     SandboxRecipientNotAllowedError,
     SandboxTrialExhaustedError,
+    SendAtInvalidError,
+    SendAtTooFarError,
     ServerError,
     TemplateRenderError,
     TemplateVariableMissingError,
@@ -95,6 +100,10 @@ def test_status_maps_to_exception(status_code: int, code: str, expected: type) -
         ),
         (403, "sandbox_trial_exhausted", SandboxTrialExhaustedError, PermissionDeniedError),
         (409, "idempotency_in_flight", IdempotencyInFlightError, ConflictError),
+        (409, "email_not_scheduled", EmailNotScheduledError, ConflictError),
+        (400, "send_at_too_far", SendAtTooFarError, BadRequestError),
+        (400, "send_at_invalid", SendAtInvalidError, BadRequestError),
+        (403, "ip_not_allowed", IPNotAllowedError, PermissionDeniedError),
         (429, "rps_exceeded", RateLimitError, RateLimitError),
     ],
 )
@@ -135,6 +144,22 @@ def test_legal_documents_error_carries_pending_list() -> None:
 
     assert isinstance(error, LegalDocumentsNotAcceptedError)
     assert error.details["pending"] == pending
+
+
+def test_email_not_scheduled_carries_current_status() -> None:
+    """По `details.status` видно, почему отмена не прошла: письмо уже ушло или отменено."""
+    error = error_from_response(
+        status_code=409,
+        body=_envelope(
+            "email_not_scheduled",
+            details={"code": "email_not_scheduled", "status": "CANCELED"},
+        ),
+        request_id=None,
+        retry_after=None,
+    )
+
+    assert isinstance(error, EmailNotScheduledError)
+    assert error.details["status"] == "CANCELED"
 
 
 def test_unknown_code_degrades_to_status_class() -> None:

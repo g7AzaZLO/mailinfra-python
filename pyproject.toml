@@ -1,6 +1,6 @@
 [project]
 name = "mailinfra"
-version = "0.1.0"
+version = "0.2.0"
 description = "Официальный Python SDK для MailInfra — email API для разработчиков"
 readme = "README.md"
 license = { text = "MIT" }
@@ -109,5 +109,10 @@ ignore_errors = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Без явного значения pytest-asyncio 1.x на старте бросает
+# PytestDeprecationWarning, а `filterwarnings = ["error"]` превращает её в
+# INTERNALERROR ещё до сбора тестов. Каждой асинхронной фикстуре — свой цикл,
+# как у тестов.
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 filterwarnings = ["error"]

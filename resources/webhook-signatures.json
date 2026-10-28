@@ -2,11 +2,11 @@
   "_comment": "Сгенерировано backend/scripts/gen_webhook_vectors.py из app.services.webhook_service.sign_payload — НЕ РЕДАКТИРОВАТЬ руками.",
   "algorithm": {
     "header": "X-MailInfra-Signature",
-    "format": "t=<unix_timestamp>,v1=<hex_hmac_sha256>",
+    "format": "t=<unix_timestamp>,v1=<hex_hmac_sha256>[,v1=<hex_hmac_sha256>]",
     "signing_string": "f'{timestamp}.' + raw_body_bytes",
     "hmac": "HMAC-SHA256(secret_utf8, signing_string) → hex",
     "max_age_seconds": 300,
-    "note": "body в векторах — UTF-8 строка; подписываются именно её байты. Проверять подпись нужно по сырому телу запроса, а не по пересериализованному JSON."
+    "note": "body в векторах — UTF-8 строка; подписываются именно её байты. Проверять подпись нужно по сырому телу запроса, а не по пересериализованному JSON. Во время ротации секрета в заголовке две подписи v1 — новым секретом и прежним (последней); подпись верна, если совпала любая из них."
   },
   "cases": [
     {
@@ -87,6 +87,36 @@
       "body": "{\"id\":\"evt_018e1b7a-2c3d-7000-8d4e-5f6a7b8c9d0e\",\"type\":\"email.delivered\",\"created_at\":\"2026-05-11T20:15:30.123456Z\",\"data\":{\"email\":{\"id\":\"018e1b7a-1111-7000-aaaa-111111111111\",\"from\":\"hello@mail.example.ru\",\"to\":[\"user@gmail.com\"],\"subject\":\"\\u0412\\u0430\\u0448 \\u0437\\u0430\\u043a\\u0430\\u0437 \\u043f\\u043e\\u0434\\u0442\\u0432\\u0435\\u0440\\u0436\\u0434\\u0451\\u043d\",\"tags\":[\"order\",\"transactional\"],\"status\":\"DELIVERED\"},\"event\":{\"mx\":\"gmail-smtp-in.l.google.com\",\"ip\":\"142.250.1.1\"}}}",
       "signature": "",
       "signature_header": "t=1715461200",
+      "valid": false
+    },
+    {
+      "name": "rotation_new_secret",
+      "description": "ротация: проверка новым секретом — первая v1",
+      "secret": "whsec_a3f4e1c2d7b89012345678901234567890abcdef1234567890abcdef12345678",
+      "timestamp": 1715461200,
+      "body": "{\"id\":\"evt_018e1b7a-2c3d-7000-8d4e-5f6a7b8c9d0e\",\"type\":\"email.delivered\",\"created_at\":\"2026-05-11T20:15:30.123456Z\",\"data\":{\"email\":{\"id\":\"018e1b7a-1111-7000-aaaa-111111111111\",\"from\":\"hello@mail.example.ru\",\"to\":[\"user@gmail.com\"],\"subject\":\"\\u0412\\u0430\\u0448 \\u0437\\u0430\\u043a\\u0430\\u0437 \\u043f\\u043e\\u0434\\u0442\\u0432\\u0435\\u0440\\u0436\\u0434\\u0451\\u043d\",\"tags\":[\"order\",\"transactional\"],\"status\":\"DELIVERED\"},\"event\":{\"mx\":\"gmail-smtp-in.l.google.com\",\"ip\":\"142.250.1.1\"}}}",
+      "signature": "215b253c8369fc2f096b8777b6f40bac651c0cfb0d16aa8f2f0bdf1c6bcc079f",
+      "signature_header": "t=1715461200,v1=215b253c8369fc2f096b8777b6f40bac651c0cfb0d16aa8f2f0bdf1c6bcc079f,v1=ebc180030a33d192e696ce807f66acbeb1df6d116bfad5a88ef4e0d6ffbb77be",
+      "valid": true
+    },
+    {
+      "name": "rotation_previous_secret",
+      "description": "ротация: проверка прежним секретом — последняя v1",
+      "secret": "whsec_0000000000000000000000000000000000000000000000000000000000000001",
+      "timestamp": 1715461200,
+      "body": "{\"id\":\"evt_018e1b7a-2c3d-7000-8d4e-5f6a7b8c9d0e\",\"type\":\"email.delivered\",\"created_at\":\"2026-05-11T20:15:30.123456Z\",\"data\":{\"email\":{\"id\":\"018e1b7a-1111-7000-aaaa-111111111111\",\"from\":\"hello@mail.example.ru\",\"to\":[\"user@gmail.com\"],\"subject\":\"\\u0412\\u0430\\u0448 \\u0437\\u0430\\u043a\\u0430\\u0437 \\u043f\\u043e\\u0434\\u0442\\u0432\\u0435\\u0440\\u0436\\u0434\\u0451\\u043d\",\"tags\":[\"order\",\"transactional\"],\"status\":\"DELIVERED\"},\"event\":{\"mx\":\"gmail-smtp-in.l.google.com\",\"ip\":\"142.250.1.1\"}}}",
+      "signature": "ebc180030a33d192e696ce807f66acbeb1df6d116bfad5a88ef4e0d6ffbb77be",
+      "signature_header": "t=1715461200,v1=215b253c8369fc2f096b8777b6f40bac651c0cfb0d16aa8f2f0bdf1c6bcc079f,v1=ebc180030a33d192e696ce807f66acbeb1df6d116bfad5a88ef4e0d6ffbb77be",
+      "valid": true
+    },
+    {
+      "name": "rotation_unknown_secret",
+      "description": "ротация: ни одна v1 не от этого секрета",
+      "secret": "whsec_0000000000000000000000000000000000000000000000000000000000000002",
+      "timestamp": 1715461200,
+      "body": "{\"id\":\"evt_018e1b7a-2c3d-7000-8d4e-5f6a7b8c9d0e\",\"type\":\"email.delivered\",\"created_at\":\"2026-05-11T20:15:30.123456Z\",\"data\":{\"email\":{\"id\":\"018e1b7a-1111-7000-aaaa-111111111111\",\"from\":\"hello@mail.example.ru\",\"to\":[\"user@gmail.com\"],\"subject\":\"\\u0412\\u0430\\u0448 \\u0437\\u0430\\u043a\\u0430\\u0437 \\u043f\\u043e\\u0434\\u0442\\u0432\\u0435\\u0440\\u0436\\u0434\\u0451\\u043d\",\"tags\":[\"order\",\"transactional\"],\"status\":\"DELIVERED\"},\"event\":{\"mx\":\"gmail-smtp-in.l.google.com\",\"ip\":\"142.250.1.1\"}}}",
+      "signature": "",
+      "signature_header": "t=1715461200,v1=215b253c8369fc2f096b8777b6f40bac651c0cfb0d16aa8f2f0bdf1c6bcc079f,v1=ebc180030a33d192e696ce807f66acbeb1df6d116bfad5a88ef4e0d6ffbb77be",
       "valid": false
     }
   ]

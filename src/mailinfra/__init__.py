@@ -15,14 +15,16 @@
 
 Что клиент делает за вас:
 
-* ставит `Idempotency-Key` на каждую отправку и переиспользует его при
-  повторах — сбой сети не превращается в два письма;
+* ставит `Idempotency-Key` на каждую отправку письма и батча и
+  переиспользует его при повторах — сбой сети не превращается в два письма;
 * повторяет `429`/`5xx`/таймауты с экспоненциальным backoff и уважает
   `Retry-After`;
 * поднимает ошибки API типизированными исключениями
   (`RateLimitError`, `DomainNotVerifiedError`, …);
 * валидирует письмо локально по OpenAPI-спеке до сетевого вызова;
-* проверяет подписи вебхуков (`mailinfra.webhooks`).
+* сам обходит страницы списка писем (`client.emails.list_all()`);
+* проверяет подписи вебхуков, в том числе в окне ротации секрета
+  (`mailinfra.webhooks`).
 
 Покрытие v1 — публичный API писем (`/v1/emails*`). Управление доменами,
 шаблонами, вебхуками и ключами — Management API на сессионном токене, оно в
@@ -41,7 +43,9 @@ from ._errors import (
     ConflictError,
     DomainNotAttachedError,
     DomainNotVerifiedError,
+    EmailNotScheduledError,
     IdempotencyInFlightError,
+    IPNotAllowedError,
     LegalDocumentsNotAcceptedError,
     MailInfraError,
     NotFoundError,
@@ -50,6 +54,8 @@ from ._errors import (
     ReservedEmailHeaderError,
     SandboxRecipientNotAllowedError,
     SandboxTrialExhaustedError,
+    SendAtInvalidError,
+    SendAtTooFarError,
     ServerError,
     TemplateRenderError,
     TemplateVariableMissingError,
@@ -70,8 +76,11 @@ from .models import (
     EmailEventPublic,
     EmailEventType,
     EmailListItem,
+    EmailListResponse,
+    EmailScheduleData,
     EmailSource,
     EmailStatus,
+    SendBatchResult,
     SendEmailResult,
     SuppressionReason,
 )
@@ -98,9 +107,13 @@ __all__ = [
     "EmailEventPublic",
     "EmailEventType",
     "EmailListItem",
+    "EmailListResponse",
+    "EmailNotScheduledError",
+    "EmailScheduleData",
     "EmailSource",
     "EmailStatus",
     "IdempotencyInFlightError",
+    "IPNotAllowedError",
     "LegalDocumentsNotAcceptedError",
     "MailInfra",
     "MailInfraError",
@@ -111,6 +124,9 @@ __all__ = [
     "RetryPolicy",
     "SandboxRecipientNotAllowedError",
     "SandboxTrialExhaustedError",
+    "SendAtInvalidError",
+    "SendAtTooFarError",
+    "SendBatchResult",
     "SendEmailResult",
     "ServerError",
     "SuppressionReason",

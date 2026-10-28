@@ -3,17 +3,44 @@
 from __future__ import annotations
 
 import base64
+import json
 from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
 import respx
 
-from mailinfra import Attachment, EmailStatus, MailInfra, MailInfraError
+from mailinfra import (
+    Attachment,
+    BatchSendResponseData,
+    BounceCategory,
+    EmailEventType,
+    EmailStatus,
+    MailInfra,
+    MailInfraError,
+)
 from mailinfra.client import AsyncMailInfra
-from mailinfra.resources.emails import MAX_BATCH_SIZE, build_send_payload
+from mailinfra.resources.emails import (
+    BATCH_IDEMPOTENCY_KEY_MAX_LENGTH,
+    MAX_BATCH_SIZE,
+    build_send_payload,
+)
 
-from .conftest import BASE_URL, EMAIL_ID, PROJECT_ID, SEND_RESPONSE
+from .conftest import BASE_URL, EMAIL_ID, PROJECT_ID, SEND_RESPONSE, list_item, list_page
+
+BATCH_ITEM = {
+    "from_email": "hello@mail.example.ru",
+    "to": "user@example.com",
+    "subject": "Тема",
+    "text": "Текст",
+}
+BATCH_RESPONSE = {
+    "data": {
+        "results": [{"index": 0, "id": EMAIL_ID, "status": "QUEUED", "skipped_recipients": []}],
+        "accepted_count": 1,
+        "failed_count": 0,
+    }
+}
 
 
 def test_payload_uses_api_aliases_and_drops_empty_values() -> None:
@@ -236,30 +263,20 @@ def test_send_reports_skipped_recipients(client: MailInfra) -> None:
 
 
 def test_list_passes_filters_as_query(client: MailInfra) -> None:
-    item = {
-        "id": EMAIL_ID,
-        "project_id": PROJECT_ID,
-        "from_email": "hello@mail.example.ru",
-        "to_emails": ["user@example.com"],
-        "subject": "Тема",
-        "status": "DELIVERED",
-        "source": "API",
-        "tags": ["order"],
-        "created_at": "2026-05-11T20:00:00Z",
-        "sent_at": "2026-05-11T20:00:01Z",
-        "delivered_at": "2026-05-11T20:00:05Z",
-    }
     with respx.mock(base_url=BASE_URL) as mock:
-        route = mock.get("/emails").mock(return_value=httpx.Response(200, json={"data": [item]}))
-        emails = client.emails.list(status=EmailStatus.DELIVERED, tag="order", limit=10)
+        route = mock.get("/emails").mock(
+            return_value=httpx.Response(200, json=list_page([list_item()]))
+        )
+        page = client.emails.list(status=EmailStatus.DELIVERED, tag="order", limit=10)
 
     query = route.calls[0].request.url.params
     assert query["status"] == "DELIVERED"
     assert query["tag"] == "order"
     assert query["limit"] == "10"
-    assert emails[0].status is EmailStatus.DELIVERED
+    assert "cursor" not in query
+    assert page.data[0].status is EmailStatus.DELIVERED
     # Строковое сравнение тоже должно работать: enum'ы — подклассы str.
-    assert emails[0].status == "DELIVERED"
+    assert page.data[0].status == "DELIVERED"
 
 
 @pytest.mark.parametrize(
@@ -277,7 +294,7 @@ def test_list_sends_datetime_filters_with_timezone(client: MailInfra, moment: da
     `datetime.now()`; Node всегда шлёт `toISOString()`, то есть UTC.
     """
     with respx.mock(base_url=BASE_URL) as mock:
-        route = mock.get("/emails").mock(return_value=httpx.Response(200, json={"data": []}))
+        route = mock.get("/emails").mock(return_value=httpx.Response(200, json=list_page([])))
         client.emails.list(from_date=moment)
 
     sent = route.calls[0].request.url.params["from"]
@@ -377,8 +394,8 @@ def test_batch_reports_per_item_errors(client: MailInfra) -> None:
     assert result.failed_count == 1
     assert result.results[1].error is not None
     assert result.results[1].error.code == "domain_not_verified"
-    # Батч идёт без заголовка идемпотентности: API его не принимает.
-    assert "Idempotency-Key" not in route.calls[0].request.headers
+    # Ключ батча SDK ставит сам — как и у одиночной отправки.
+    assert route.calls[0].request.headers["Idempotency-Key"] == result.idempotency_key
 
 
 def test_batch_rejects_empty_list(client: MailInfra) -> None:
@@ -403,8 +420,8 @@ def test_batch_rejects_oversized_list(client: MailInfra) -> None:
 def test_batch_rejects_per_item_idempotency_key(client: MailInfra) -> None:
     """README описывает элементы батча как параметры `send()`, а тот берёт ключ.
 
-    Эндпоинт батча заголовок не принимает вовсе; раньше это был голый
-    TypeError мимо всех документированных except-ов.
+    У батча ключ один на весь запрос — ключ письма выводит из него бэкенд;
+    раньше это был голый TypeError мимо всех документированных except-ов.
     """
     with pytest.raises(MailInfraError) as excinfo:
         client.emails.send_batch(
@@ -420,6 +437,7 @@ def test_batch_rejects_per_item_idempotency_key(client: MailInfra) -> None:
         )
 
     assert excinfo.value.code == "invalid_batch_item"
+    assert "send_batch(..., idempotency_key=...)" in str(excinfo.value)
 
 
 def test_batch_reports_unknown_field_as_mailinfra_error(client: MailInfra) -> None:
@@ -617,3 +635,208 @@ def test_unparsed_batch_and_list_keep_request_id(client: MailInfra) -> None:
         "req-b",
     )
     assert (listed.value.status_code, listed.value.request_id) == (200, "req-l")
+
+
+def test_payload_passes_inline_attachment_content_id() -> None:
+    """`content_id` делает вложение inline-картинкой: в HTML это `cid:logo`."""
+    payload = build_send_payload(
+        from_email="hello@mail.example.ru",
+        to="user@example.com",
+        subject="Тема",
+        html='<img src="cid:logo">',
+        attachments=[
+            Attachment(
+                filename="logo.png", content=b"\x89PNG", content_type="image/png", content_id="logo"
+            ),
+            {"filename": "banner.png", "content": b"\x89PNG", "content_id": "banner"},
+            Attachment(filename="bill.pdf", content=b"%PDF-1.4"),
+        ],
+    )
+
+    inline, from_mapping, regular = payload["attachments"]
+    assert inline["content_id"] == "logo"
+    assert from_mapping["content_id"] == "banner"
+    # Обычное вложение уходит без поля, а не с `"content_id": null`.
+    assert "content_id" not in regular
+
+
+def test_payload_rejects_too_long_content_id() -> None:
+    with pytest.raises(MailInfraError) as excinfo:
+        build_send_payload(
+            from_email="hello@mail.example.ru",
+            to="user@example.com",
+            subject="Тема",
+            text="Текст",
+            attachments=[Attachment(filename="a.png", content=b"x", content_id="x" * 258)],
+        )
+
+    assert excinfo.value.code == "invalid_request"
+    assert excinfo.value.details["fields"][0]["field"] == "attachments.0.content_id"
+
+
+def test_batch_sets_idempotency_key_and_reports_it(client: MailInfra) -> None:
+    with respx.mock(base_url=BASE_URL) as mock:
+        route = mock.post("/emails/batch").mock(
+            return_value=httpx.Response(202, json=BATCH_RESPONSE, headers={"X-Request-ID": "req-b"})
+        )
+        result = client.emails.send_batch([BATCH_ITEM])
+
+    assert route.calls[0].request.headers["Idempotency-Key"] == result.idempotency_key
+    assert result.replayed is False
+    assert result.request_id == "req-b"
+    assert result.accepted_count == 1
+    # Новый результат — подкласс прежнего типа: код на 0.1.0 не ломается.
+    assert isinstance(result, BatchSendResponseData)
+
+
+def test_batch_honours_explicit_idempotency_key(client: MailInfra) -> None:
+    with respx.mock(base_url=BASE_URL) as mock:
+        route = mock.post("/emails/batch").mock(
+            return_value=httpx.Response(202, json=BATCH_RESPONSE)
+        )
+        result = client.emails.send_batch([BATCH_ITEM], idempotency_key="newsletter_42")
+
+    assert route.calls[0].request.headers["Idempotency-Key"] == "newsletter_42"
+    assert result.idempotency_key == "newsletter_42"
+
+
+def test_batch_marks_idempotent_replay(client: MailInfra) -> None:
+    """`200` + `Idempotent-Replayed`: все принятые письма уже были приняты раньше."""
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.post("/emails/batch").mock(
+            return_value=httpx.Response(
+                200, json=BATCH_RESPONSE, headers={"Idempotent-Replayed": "true"}
+            )
+        )
+        result = client.emails.send_batch([BATCH_ITEM], idempotency_key="newsletter_42")
+
+    assert result.replayed is True
+
+
+def test_batch_key_limit_is_shorter_than_send_key_limit(client: MailInfra) -> None:
+    """Бэкенд дописывает к ключу батча номер письма — предел 252, а не 255."""
+    with respx.mock(base_url=BASE_URL) as mock:
+        route = mock.post("/emails/batch").mock(
+            return_value=httpx.Response(202, json=BATCH_RESPONSE)
+        )
+        client.emails.send_batch(
+            [BATCH_ITEM], idempotency_key="k" * BATCH_IDEMPOTENCY_KEY_MAX_LENGTH
+        )
+        with pytest.raises(MailInfraError) as excinfo:
+            client.emails.send_batch(
+                [BATCH_ITEM], idempotency_key="k" * (BATCH_IDEMPOTENCY_KEY_MAX_LENGTH + 1)
+            )
+
+    assert excinfo.value.code == "invalid_idempotency_key"
+    assert route.call_count == 1
+
+
+def test_batch_without_auto_idempotency_sends_no_key() -> None:
+    with (
+        MailInfra(
+            api_key="mi_test_0123456789abcdef0123456789abcdef",
+            base_url=BASE_URL,
+            auto_idempotency=False,
+        ) as client,
+        respx.mock(base_url=BASE_URL) as mock,
+    ):
+        route = mock.post("/emails/batch").mock(
+            return_value=httpx.Response(202, json=BATCH_RESPONSE)
+        )
+        result = client.emails.send_batch([BATCH_ITEM])
+
+    assert "Idempotency-Key" not in route.calls[0].request.headers
+    assert result.idempotency_key is None
+
+
+def test_unparsed_batch_response_keeps_idempotency_key(client: MailInfra) -> None:
+    """Письма батча уже приняты: с ключом из ошибки повтор не создаст дублей."""
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.post("/emails/batch").mock(
+            return_value=httpx.Response(202, json={"data": {"unexpected": True}})
+        )
+        with pytest.raises(MailInfraError) as caught:
+            client.emails.send_batch([BATCH_ITEM], idempotency_key="newsletter_42")
+
+    assert caught.value.code == "malformed_response"
+    assert caught.value.details["idempotency_key"] == "newsletter_42"
+
+
+def test_batch_items_carry_new_fields(client: MailInfra) -> None:
+    """Элемент батча — те же параметры, что у `send()`, включая новые поля."""
+    with respx.mock(base_url=BASE_URL) as mock:
+        route = mock.post("/emails/batch").mock(
+            return_value=httpx.Response(202, json=BATCH_RESPONSE)
+        )
+        client.emails.send_batch(
+            [
+                {
+                    **BATCH_ITEM,
+                    "metadata": {"order_id": "4242"},
+                    "send_at": datetime(2026, 11, 1, 9, 0, tzinfo=timezone(timedelta(hours=3))),
+                    "ttl": 3600,
+                }
+            ]
+        )
+
+    sent = json.loads(route.calls[0].request.read())["emails"][0]
+    assert sent["metadata"] == {"order_id": "4242"}
+    assert sent["send_at"] == "2026-11-01T09:00:00+03:00"
+    assert sent["ttl"] == 3600
+
+
+async def test_async_batch_retries_with_the_same_key(async_client: AsyncMailInfra) -> None:
+    with respx.mock(base_url=BASE_URL) as mock:
+        route = mock.post("/emails/batch").mock(
+            side_effect=[httpx.Response(503), httpx.Response(202, json=BATCH_RESPONSE)]
+        )
+        result = await async_client.emails.send_batch([BATCH_ITEM])
+
+    keys = {call.request.headers["Idempotency-Key"] for call in route.calls}
+    assert route.call_count == 2
+    assert keys == {result.idempotency_key}
+
+
+def test_email_objects_expose_new_fields(client: MailInfra) -> None:
+    """metadata, scheduled_at, expires_at и новые значения enum'ов разбираются."""
+    detail = _detail_with_status("SCHEDULED")
+    detail["data"].update(
+        {
+            "metadata": {"order_id": "4242"},
+            "scheduled_at": "2026-11-01T06:00:00Z",
+            "expires_at": "2026-11-01T07:00:00Z",
+            "bounce_category": "delivery-expired",
+        }
+    )
+    events = {
+        "data": [
+            {
+                "id": "018e1b7a-3333-7000-cccc-333333333333",
+                "type": event_type,
+                "data": {},
+                "timestamp": "2026-05-11T20:00:05Z",
+            }
+            for event_type in ("scheduled", "canceled")
+        ]
+    }
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get(f"/emails/{EMAIL_ID}").mock(return_value=httpx.Response(200, json=detail))
+        mock.get(f"/emails/{EMAIL_ID}/events").mock(return_value=httpx.Response(200, json=events))
+        mock.get("/emails").mock(
+            return_value=httpx.Response(
+                200, json=list_page([list_item(status="CANCELED", metadata={"k": "v"})])
+            )
+        )
+
+        email = client.emails.get(EMAIL_ID)
+        history = client.emails.events(EMAIL_ID)
+        listed = client.emails.list().data[0]
+
+    assert email.status is EmailStatus.SCHEDULED
+    assert email.metadata == {"order_id": "4242"}
+    assert email.scheduled_at == datetime(2026, 11, 1, 6, 0, tzinfo=timezone.utc)
+    assert email.expires_at == datetime(2026, 11, 1, 7, 0, tzinfo=timezone.utc)
+    assert email.bounce_category is BounceCategory.delivery_expired
+    assert [event.type for event in history] == [EmailEventType.scheduled, EmailEventType.canceled]
+    assert listed.status is EmailStatus.CANCELED
+    assert listed.metadata == {"k": "v"}

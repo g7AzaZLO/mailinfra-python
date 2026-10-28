@@ -53,6 +53,46 @@ SEND_RESPONSE: dict[str, Any] = {
 }
 
 
+def list_item(email_id: str = EMAIL_ID, **overrides: Any) -> dict[str, Any]:
+    """Письмо в сокращённом виде, как его отдаёт `GET /v1/emails`.
+
+    Args:
+        email_id: Идентификатор письма.
+        **overrides: Поля, которые нужно заменить или добавить.
+
+    Returns:
+        Элемент `data` страницы списка.
+    """
+    item: dict[str, Any] = {
+        "id": email_id,
+        "project_id": PROJECT_ID,
+        "from_email": "hello@mail.example.ru",
+        "to_emails": ["user@example.com"],
+        "subject": "Тема",
+        "status": "DELIVERED",
+        "source": "API",
+        "tags": ["order"],
+        "metadata": {},
+        "created_at": "2026-05-11T20:00:00Z",
+        "sent_at": "2026-05-11T20:00:01Z",
+        "delivered_at": "2026-05-11T20:00:05Z",
+    }
+    return {**item, **overrides}
+
+
+def list_page(items: list[dict[str, Any]], *, next_cursor: str | None = None) -> dict[str, Any]:
+    """Тело ответа `GET /v1/emails`.
+
+    Args:
+        items: Письма страницы.
+        next_cursor: Курсор следующей страницы; `None` — страница последняя.
+
+    Returns:
+        Страница с `data`, `has_more` и `next_cursor`.
+    """
+    return {"data": items, "has_more": next_cursor is not None, "next_cursor": next_cursor}
+
+
 @pytest.fixture(scope="session")
 def spec() -> dict[str, Any]:
     """Публичная OpenAPI-спека — источник правды для моделей.

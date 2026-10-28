@@ -5,7 +5,8 @@ SDK. Спека перегенерируется из FastAPI, в ней поя�
 тест краснеет, пока у неё нет метода в клиенте.
 
 Заодно проверяются пути и признак идемпотентности: `Idempotency-Key` описан
-в спеке только у `POST /emails`, и именно так SDK и должен считать.
+в спеке у `POST /emails` и `POST /emails/batch`, и именно так SDK и должен
+считать.
 """
 
 from __future__ import annotations
@@ -16,7 +17,9 @@ from typing import Any
 import pytest
 
 from mailinfra.resources.emails import (
+    BATCH_IDEMPOTENCY_KEY_MAX_LENGTH,
     IDEMPOTENCY_KEY_HEADER,
+    IDEMPOTENCY_KEY_MAX_LENGTH,
     AsyncEmailsResource,
     EmailsResource,
     _list_params,
@@ -30,6 +33,17 @@ OPERATION_METHODS: dict[str, str] = {
     "get_email": "get",
     "list_emails": "list",
     "list_email_events": "events",
+    "cancel_email": "cancel",
+    "reschedule_email": "reschedule",
+}
+
+# Методы без своей операции в спеке: обёртки над операциями выше.
+HELPER_METHODS: tuple[str, ...] = ("list_all",)
+
+# Эндпоинты, которые принимают `Idempotency-Key`, и предел длины ключа у SDK.
+IDEMPOTENT_ENDPOINTS: dict[tuple[str, str], int] = {
+    ("/emails", "post"): IDEMPOTENCY_KEY_MAX_LENGTH,
+    ("/emails/batch", "post"): BATCH_IDEMPOTENCY_KEY_MAX_LENGTH,
 }
 
 
@@ -69,9 +83,13 @@ def test_methods_exist_on_both_clients(resource: type, spec: dict[str, Any]) -> 
         assert callable(getattr(resource, method_name, None)), (
             f"{resource.__name__} не реализует {method_name} для операции {operation_id}"
         )
+    for method_name in HELPER_METHODS:
+        assert callable(getattr(resource, method_name, None)), (
+            f"{resource.__name__} не реализует {method_name}"
+        )
 
 
-@pytest.mark.parametrize("method_name", sorted(set(OPERATION_METHODS.values())))
+@pytest.mark.parametrize("method_name", sorted({*OPERATION_METHODS.values(), *HELPER_METHODS}))
 def test_sync_and_async_signatures_match(method_name: str) -> None:
     """Синхронный и асинхронный ресурсы — построчные близнецы, и это осознанно.
 
@@ -104,12 +122,26 @@ def test_send_forwards_every_payload_field() -> None:
     )
 
 
-def test_list_forwards_every_filter() -> None:
-    """То же для фильтров списка."""
+@pytest.mark.parametrize("method_name", ["list", "list_all"])
+def test_list_forwards_every_filter(method_name: str) -> None:
+    """То же для фильтров списка — и у страницы, и у обхода всех страниц."""
     filter_fields = set(inspect.signature(_list_params).parameters)
-    list_fields = set(inspect.signature(EmailsResource.list).parameters) - {"self"}
+    method = getattr(EmailsResource, method_name)
+    list_fields = set(inspect.signature(method).parameters) - {"self"}
 
     assert list_fields == filter_fields
+
+
+def test_list_accepts_cursor_from_spec(spec: dict[str, Any]) -> None:
+    """Курсорная пагинация: SDK обязан уметь передать `cursor` в query."""
+    query = {
+        parameter["name"]
+        for parameter in spec["paths"]["/emails"]["get"]["parameters"]
+        if parameter.get("in") == "query"
+    }
+
+    assert "cursor" in query
+    assert "cursor" in inspect.signature(_list_params).parameters
 
 
 def test_operation_ids_are_clean(spec: dict[str, Any]) -> None:
@@ -132,20 +164,31 @@ def test_paths_used_by_sdk_match_spec(spec: dict[str, Any]) -> None:
     assert operations["get_email"] == ("/emails/{email_id}", "get")
     assert operations["list_emails"] == ("/emails", "get")
     assert operations["list_email_events"] == ("/emails/{email_id}/events", "get")
+    assert operations["cancel_email"] == ("/emails/{email_id}/cancel", "post")
+    assert operations["reschedule_email"] == ("/emails/{email_id}", "patch")
 
 
-def test_only_send_declares_idempotency_header(spec: dict[str, Any]) -> None:
+def test_idempotency_header_matches_spec(spec: dict[str, Any]) -> None:
+    """Ключ ставится ровно там, где его принимает API, и не длиннее его предела.
+
+    У батча предел короче (252): бэкенд дописывает к ключу номер письма.
+    """
     for path, item in spec["paths"].items():
         for method, operation in item.items():
             if not isinstance(operation, dict):
                 continue
             headers = {
-                parameter["name"]
+                parameter["name"]: parameter["schema"]
                 for parameter in operation.get("parameters", [])
                 if parameter.get("in") == "header"
             }
-            expected = {IDEMPOTENCY_KEY_HEADER} if (path, method) == ("/emails", "post") else set()
-            assert headers == expected, f"{method.upper()} {path}: заголовки {headers}"
+            if (path, method) not in IDEMPOTENT_ENDPOINTS:
+                assert not headers, f"{method.upper()} {path}: заголовки {sorted(headers)}"
+                continue
+            assert set(headers) == {IDEMPOTENCY_KEY_HEADER}, f"{method.upper()} {path}"
+            assert (
+                headers[IDEMPOTENCY_KEY_HEADER]["maxLength"] == IDEMPOTENT_ENDPOINTS[(path, method)]
+            ), f"{method.upper()} {path}: предел длины ключа разошёлся со спекой"
 
 
 def test_spec_documents_rate_limit_and_replay(spec: dict[str, Any]) -> None:

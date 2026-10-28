@@ -22,9 +22,37 @@ from mailinfra import (
     UnprocessableError,
 )
 
-from .conftest import BASE_URL, SEND_RESPONSE, TEST_API_KEY
+from .conftest import BASE_URL, EMAIL_ID, SEND_RESPONSE, TEST_API_KEY
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
+
+BATCH_ITEM = {
+    "from_email": "hello@mail.example.ru",
+    "to": "user@example.com",
+    "subject": "Тема",
+    "text": "Текст",
+}
+BATCH_RESPONSE = {
+    "data": {
+        "results": [{"index": 0, "id": EMAIL_ID, "status": "QUEUED"}],
+        "accepted_count": 1,
+        "failed_count": 0,
+    }
+}
+
+
+def _client_without_auto_key() -> MailInfra:
+    """Клиент без авто-ключа: отправка и батч у него неидемпотентны.
+
+    Returns:
+        Клиент с двумя повторами и нулевым backoff.
+    """
+    return MailInfra(
+        api_key=TEST_API_KEY,
+        base_url=BASE_URL,
+        auto_idempotency=False,
+        retry_policy=RetryPolicy(max_retries=2, initial_backoff=0.0),
+    )
 
 
 def _send(client: MailInfra) -> object:
@@ -143,23 +171,38 @@ def test_does_not_retry_validation_error(client: MailInfra) -> None:
     assert excinfo.value.fields[0]["field"] == "to"
 
 
-def test_batch_is_not_retried_on_server_error(client: MailInfra) -> None:
-    """Батч неидемпотентен: повтор после `5xx` мог бы отправить часть писем дважды."""
-    with respx.mock(base_url=BASE_URL) as mock:
+def test_batch_without_key_is_not_retried_on_server_error(no_sleep: list[float]) -> None:
+    """Батч без ключа неидемпотентен: повтор после `5xx` мог бы отправить часть писем дважды."""
+    with _client_without_auto_key() as client, respx.mock(base_url=BASE_URL) as mock:
         route = mock.post("/emails/batch").mock(return_value=httpx.Response(500))
         with pytest.raises(ServerError):
-            client.emails.send_batch(
-                [
-                    {
-                        "from_email": "hello@mail.example.ru",
-                        "to": "user@example.com",
-                        "subject": "Тема",
-                        "text": "Текст",
-                    }
-                ]
-            )
+            client.emails.send_batch([BATCH_ITEM])
 
     assert route.call_count == 1
+    assert "Idempotency-Key" not in route.calls[0].request.headers
+
+
+def test_batch_with_key_is_retried_with_the_same_key(client: MailInfra) -> None:
+    """С ключом батч идемпотентен: бэкенд выводит из него ключ каждого письма.
+
+    Повтор после `503` не дублирует уже принятые письма — но только если ключ
+    тот же, что у первой попытки.
+    """
+    with respx.mock(base_url=BASE_URL) as mock:
+        route = mock.post("/emails/batch").mock(
+            side_effect=[
+                httpx.Response(503),
+                httpx.ReadTimeout("slow"),
+                httpx.Response(202, json=BATCH_RESPONSE),
+            ]
+        )
+        result = client.emails.send_batch([BATCH_ITEM])
+
+    keys = {call.request.headers["Idempotency-Key"] for call in route.calls}
+    assert route.call_count == 3
+    assert len(keys) == 1
+    assert result.idempotency_key == keys.pop()
+    assert result.replayed is False
 
 
 def test_batch_is_retried_on_rate_limit(client: MailInfra) -> None:
@@ -249,56 +292,41 @@ def test_retries_disabled_when_max_retries_is_zero(no_sleep: list[float]) -> Non
     assert no_sleep == []
 
 
-def test_batch_is_not_retried_on_timeout() -> None:
-    """Таймаут батча — не повод повторять: письма коммитятся по одному.
+def test_batch_without_key_is_not_retried_on_timeout(no_sleep: list[float]) -> None:
+    """Таймаут батча без ключа — не повод повторять: письма коммитятся по одному.
 
     Ответа нет, но это не значит, что сервер ничего не принял: часть батча
-    могла уже уехать. Повтор отправил бы её второй раз.
+    могла уже уехать. Без ключа повтор отправил бы её второй раз.
     """
-    with (
-        MailInfra(
-            api_key=TEST_API_KEY, base_url=BASE_URL, retry_policy=RetryPolicy(max_retries=2)
-        ) as client,
-        respx.mock(base_url=BASE_URL) as mock,
-    ):
+    with _client_without_auto_key() as client, respx.mock(base_url=BASE_URL) as mock:
         route = mock.post("/emails/batch").mock(side_effect=httpx.ReadTimeout("slow"))
         with pytest.raises(APITimeoutError):
-            client.emails.send_batch(
-                [
-                    {
-                        "from_email": "hello@mail.example.ru",
-                        "to": "user@example.com",
-                        "subject": "Тема",
-                        "text": "Текст",
-                    }
-                ]
-            )
+            client.emails.send_batch([BATCH_ITEM])
 
     assert route.call_count == 1
 
 
-def test_batch_is_not_retried_on_connection_error() -> None:
+def test_batch_without_key_is_not_retried_on_connection_error(no_sleep: list[float]) -> None:
     """Обрыв соединения тоже неоднозначен: запрос мог дойти и выполниться."""
-    with (
-        MailInfra(
-            api_key=TEST_API_KEY, base_url=BASE_URL, retry_policy=RetryPolicy(max_retries=2)
-        ) as client,
-        respx.mock(base_url=BASE_URL) as mock,
-    ):
+    with _client_without_auto_key() as client, respx.mock(base_url=BASE_URL) as mock:
         route = mock.post("/emails/batch").mock(side_effect=httpx.ConnectError("boom"))
         with pytest.raises(APIConnectionError):
-            client.emails.send_batch(
-                [
-                    {
-                        "from_email": "hello@mail.example.ru",
-                        "to": "user@example.com",
-                        "subject": "Тема",
-                        "text": "Текст",
-                    }
-                ]
-            )
+            client.emails.send_batch([BATCH_ITEM])
 
     assert route.call_count == 1
+
+
+def test_cancel_is_retried_on_server_error(client: MailInfra) -> None:
+    """Отмена идемпотентна по результату: повтор после `503` безопасен."""
+    schedule = {"data": {"id": EMAIL_ID, "status": "CANCELED", "scheduled_at": None}}
+    with respx.mock(base_url=BASE_URL) as mock:
+        route = mock.post(f"/emails/{EMAIL_ID}/cancel").mock(
+            side_effect=[httpx.Response(503), httpx.Response(200, json=schedule)]
+        )
+        result = client.emails.cancel(EMAIL_ID)
+
+    assert route.call_count == 2
+    assert result.status == "CANCELED"
 
 
 def test_send_without_idempotency_key_is_not_retried_on_server_error(

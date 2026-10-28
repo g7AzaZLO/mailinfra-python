@@ -22,7 +22,7 @@ import pytest
 from pydantic import BaseModel
 from pydantic.fields import FieldInfo
 
-from mailinfra import models
+from mailinfra import _validation, models
 
 # Модели, которые SDK отдаёт наружу, и их схемы в спеке.
 MODEL_TO_SCHEMA: dict[type[BaseModel], str] = {
@@ -34,8 +34,11 @@ MODEL_TO_SCHEMA: dict[type[BaseModel], str] = {
     models.BatchSendResponseData: "BatchSendResponseData",
     models.BatchSendError: "BatchSendError",
     models.EmailListItem: "EmailListItem",
+    models.EmailListResponse: "EmailListResponse",
     models.EmailDetail: "EmailDetail",
     models.EmailEventPublic: "EmailEventPublic",
+    models.EmailScheduleData: "EmailScheduleData",
+    models.EmailRescheduleRequest: "EmailRescheduleRequest",
     models.ErrorResponse: "ErrorResponse",
     models.ErrorDetails: "ErrorDetails",
 }
@@ -250,6 +253,25 @@ def test_every_public_schema_is_covered(spec: dict[str, Any]) -> None:
 
     missing = set(spec["components"]["schemas"]) - covered - ignored
     assert not missing, f"Схемы без публичной модели SDK: {sorted(missing)}"
+
+
+@pytest.mark.parametrize(
+    ("validating", "generated"),
+    [
+        (_validation.SendRequest, models.EmailSendRequest),
+        (_validation.RescheduleRequest, models.EmailRescheduleRequest),
+    ],
+    ids=["send", "reschedule"],
+)
+def test_validating_models_keep_spec_fields(
+    validating: type[BaseModel], generated: type[BaseModel]
+) -> None:
+    """Валидирующий подкласс добавляет проверки, но не поля.
+
+    Иначе клиент отправлял бы то, чего нет в спеке, — а набор полей
+    сгенерированной модели уже сверен с ней тестами выше.
+    """
+    assert _wire_names(validating).keys() == _wire_names(generated).keys()
 
 
 def test_send_request_alias_is_from(spec: dict[str, Any]) -> None:

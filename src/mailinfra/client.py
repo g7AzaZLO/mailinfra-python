@@ -3,7 +3,7 @@
 Оба поверх httpx и оба реализуют один и тот же контракт:
 
 * аутентификация по API-ключу проекта (`mi_live_…` / `mi_test_…`);
-* автоматический `Idempotency-Key` на отправке письма;
+* автоматический `Idempotency-Key` на отправке письма и батча;
 * повторы с экспоненциальным backoff и уважением `Retry-After`;
 * ошибки API, поднятые как типизированные исключения (`mailinfra.errors`).
 
@@ -198,14 +198,16 @@ class _BaseClient:
         except ValueError:
             return response.text
 
-    def _unwrap(self, response: httpx.Response) -> Any:
+    def _unwrap(self, response: httpx.Response, *, envelope: bool) -> Any:
         """Достаёт поле `data` из успешного ответа.
 
         Args:
             response: Успешный ответ API.
+            envelope: Вернуть тело целиком, а не только `data`: у списка
+                писем рядом с `data` лежат `has_more` и `next_cursor`.
 
         Returns:
-            Значение `data`.
+            Значение `data` либо, при `envelope=True`, всё тело ответа.
 
         Raises:
             MailInfraError: Если ответ успешен, но не по контракту — иначе
@@ -219,7 +221,7 @@ class _BaseClient:
                 code="malformed_response",
                 request_id=response.headers.get(REQUEST_ID_HEADER),
             )
-        return body["data"]
+        return body if envelope else body["data"]
 
     def _error(self, response: httpx.Response) -> MailInfraError:
         """Строит исключение по неуспешному ответу.
@@ -273,7 +275,7 @@ class _BaseClient:
 
         Отсутствие ответа НЕ означает, что сервер ничего не принял: таймаут
         чтения и обрыв соединения случаются и после того, как запрос дошёл и
-        был выполнен. Поэтому неидемпотентный запрос (батч, отправка без
+        был выполнен. Поэтому неидемпотентный запрос (отправка или батч без
         `Idempotency-Key`) здесь не повторяется — повтор отправил бы письма
         второй раз, а это хуже, чем честный отказ.
 
@@ -310,7 +312,8 @@ class MailInfra(_BaseClient):
     Без `api_key` ключ берётся из переменной окружения `MAILINFRA_API_KEY`.
 
     Attributes:
-        emails: Ресурс писем (`send`, `send_batch`, `get`, `list`, `events`).
+        emails: Ресурс писем (`send`, `send_batch`, `get`, `list`,
+            `list_all`, `events`, `cancel`, `reschedule`).
         environment: `"live"` или `"test"` — распознано по префиксу ключа.
     """
 
@@ -403,11 +406,12 @@ class MailInfra(_BaseClient):
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         idempotent: bool = True,
+        envelope: bool = False,
     ) -> tuple[Any, httpx.Response]:
         """Выполняет запрос и отдаёт вместе с данными сам ответ.
 
         Ответ нужен там, где важны заголовки: `Idempotent-Replayed` при
-        отправке письма и `X-Request-ID` для логов.
+        отправке письма и батча и `X-Request-ID` для логов.
 
         Args:
             method: HTTP-метод.
@@ -416,6 +420,7 @@ class MailInfra(_BaseClient):
             params: Query-параметры.
             headers: Дополнительные заголовки.
             idempotent: Можно ли безопасно повторить запрос.
+            envelope: Отдать тело ответа целиком, а не только `data`.
 
         Returns:
             Пара «данные, ответ».
@@ -453,7 +458,7 @@ class MailInfra(_BaseClient):
                 continue
 
             if response.is_success:
-                return self._unwrap(response), response
+                return self._unwrap(response, envelope=envelope), response
 
             delay = self._delay_after_response(response, attempt=attempt, idempotent=idempotent)
             if delay is None:
@@ -584,6 +589,7 @@ class AsyncMailInfra(_BaseClient):
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         idempotent: bool = True,
+        envelope: bool = False,
     ) -> tuple[Any, httpx.Response]:
         """Выполняет запрос и отдаёт вместе с данными сам ответ.
 
@@ -594,6 +600,7 @@ class AsyncMailInfra(_BaseClient):
             params: Query-параметры.
             headers: Дополнительные заголовки.
             idempotent: Можно ли безопасно повторить запрос.
+            envelope: Отдать тело ответа целиком, а не только `data`.
 
         Returns:
             Пара «данные, ответ».
@@ -631,7 +638,7 @@ class AsyncMailInfra(_BaseClient):
                 continue
 
             if response.is_success:
-                return self._unwrap(response), response
+                return self._unwrap(response, envelope=envelope), response
 
             delay = self._delay_after_response(response, attempt=attempt, idempotent=idempotent)
             if delay is None:

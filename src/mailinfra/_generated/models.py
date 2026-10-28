@@ -38,6 +38,7 @@ class BounceCategory(str, Enum):
     connection_error = 'connection-error'
     rate_limited = 'rate-limited'
     auth_failure = 'auth-failure'
+    delivery_expired = 'delivery-expired'
     unknown = 'unknown'
 
 
@@ -73,6 +74,10 @@ class EmailAttachmentInput(BaseModel):
     """
 
     content_base64: Annotated[str, Field(max_length=14348938)]
+    content_id: Annotated[str | None, Field(max_length=257)] = None
+    """
+    Content-ID inline-картинки: в HTML на неё ссылаются как `cid:<content_id>`. Такое вложение встраивается в письмо, а не прикладывается файлом.
+    """
     content_type: Annotated[str | None, Field(max_length=255)] = (
         'application/octet-stream'
     )
@@ -80,6 +85,7 @@ class EmailAttachmentInput(BaseModel):
 
 
 class EmailEventType(str, Enum):
+    scheduled = 'scheduled'
     queued = 'queued'
     sending = 'sending'
     sent = 'sent'
@@ -92,6 +98,18 @@ class EmailEventType(str, Enum):
     failed = 'failed'
     simulated = 'simulated'
     deferred = 'deferred'
+    canceled = 'canceled'
+
+
+class EmailRescheduleRequest(BaseModel):
+    """
+    PATCH /v1/emails/{id}: перенос запланированного письма.
+    """
+
+    send_at: datetime
+    """
+    Новое время отправки с часовым поясом, не дальше 7 дней от приёма письма. Время в прошлом — отправить сейчас.
+    """
 
 
 class EmailSendRequest(BaseModel):
@@ -108,12 +126,24 @@ class EmailSendRequest(BaseModel):
     from_name: Annotated[str | None, Field(max_length=200)] = None
     headers: dict[str, str] | None = None
     html: Annotated[str | None, Field(max_length=26214400)] = None
+    metadata: dict[str, str] | None = None
+    """
+    Ваши пары «ключ — значение» (номер заказа, id пользователя): вернутся в GET /v1/emails и в каждом вебхуке письма. До 20 ключей, значения — строки до 500 символов.
+    """
     reply_to: Annotated[list[EmailStr] | None, Field(max_length=10)] = None
+    send_at: datetime | None = None
+    """
+    Отложенная отправка: ISO 8601 с часовым поясом, не дальше 7 дней вперёд. Письмо получит статус SCHEDULED; до отправки его можно отменить или перенести. Время в прошлом — отправить сразу.
+    """
     subject: Annotated[str | None, Field(max_length=998)] = None
     tags: Annotated[list[str] | None, Field(max_length=10)] = None
     template: Annotated[str | None, Field(max_length=100)] = None
     text: Annotated[str | None, Field(max_length=26214400)] = None
     to: Annotated[list[EmailStr], Field(max_length=50, min_length=1)]
+    ttl: Annotated[int | None, Field(ge=60, le=86400)] = None
+    """
+    Срок жизни письма в секундах (от минуты до суток), отсчёт от send_at или от приёма. Не дошедшее за это время письмо не отправляется и не повторяется: статус FAILED с причиной expired или отказ с категорией delivery-expired. Для кодов входа и других писем, которые поздно уже не нужны.
+    """
     variables: dict[str, Any] | None = None
 
 
@@ -128,6 +158,7 @@ class EmailSource(str, Enum):
 
 
 class EmailStatus(str, Enum):
+    SCHEDULED = 'SCHEDULED'
     QUEUED = 'QUEUED'
     SENDING = 'SENDING'
     SENT = 'SENT'
@@ -136,6 +167,7 @@ class EmailStatus(str, Enum):
     COMPLAINED = 'COMPLAINED'
     FAILED = 'FAILED'
     SIMULATED = 'SIMULATED'
+    CANCELED = 'CANCELED'
 
 
 class ErrorDetails(BaseModel):
@@ -189,6 +221,7 @@ class EmailDetail(BaseModel):
     dkim_selector: str | None = None
     dkim_signing_status: DkimSigningStatus | None = None
     dmarc_aligned: bool | None = None
+    expires_at: datetime | None = None
     failed_at: datetime | None = None
     final_smtp_code: int | None = None
     final_smtp_enhanced: str | None = None
@@ -199,8 +232,10 @@ class EmailDetail(BaseModel):
     html_body: str | None = None
     id: UUID
     message_id: str | None = None
+    metadata: dict[str, str] | None = None
     project_id: UUID
     reply_to: list[str] | None = None
+    scheduled_at: datetime | None = None
     sent_at: datetime | None = None
     source: EmailSource | None = EmailSource.API
     spf_aligned: bool | None = None
@@ -237,13 +272,16 @@ class EmailListItem(BaseModel):
     dkim_selector: str | None = None
     dkim_signing_status: DkimSigningStatus | None = None
     dmarc_aligned: bool | None = None
+    expires_at: datetime | None = None
     final_smtp_code: int | None = None
     final_smtp_enhanced: str | None = None
     final_smtp_text: str | None = None
     from_email: str
     id: UUID
     message_id: str | None = None
+    metadata: dict[str, str] | None = None
     project_id: UUID
+    scheduled_at: datetime | None = None
     sent_at: datetime | None = None
     source: EmailSource | None = EmailSource.API
     spf_aligned: bool | None = None
@@ -254,6 +292,32 @@ class EmailListItem(BaseModel):
     suppression_reason: SuppressionReason | None = None
     tags: list[str]
     to_emails: list[str]
+
+
+class EmailListResponse(BaseModel):
+    """
+    GET /v1/emails: страница писем проекта, новые сначала.
+    """
+
+    data: list[EmailListItem]
+    has_more: bool
+    """
+    Есть ли ещё письма после этой страницы.
+    """
+    next_cursor: str | None = None
+    """
+    Передайте в параметр `cursor`, чтобы получить следующую страницу.
+    """
+
+
+class EmailScheduleData(BaseModel):
+    """
+    Ответ отмены и переноса: только состояние планирования, без тела письма.
+    """
+
+    id: UUID
+    scheduled_at: datetime | None = None
+    status: EmailStatus
 
 
 class EmailSendResponseData(BaseModel):
@@ -276,13 +340,13 @@ class DataResponseEmailDetail(BaseModel):
     data: EmailDetail
 
 
+class DataResponseEmailScheduleData(BaseModel):
+    data: EmailScheduleData
+
+
 class DataResponseEmailSendResponseData(BaseModel):
     data: EmailSendResponseData
 
 
 class DataResponseListEmailEventPublic(BaseModel):
     data: list[EmailEventPublic]
-
-
-class DataResponseListEmailListItem(BaseModel):
-    data: list[EmailListItem]

@@ -224,3 +224,111 @@ def test_non_ascii_signature_is_rejected_not_crashed() -> None:
     with pytest.raises(webhooks.WebhookSignatureError) as excinfo:
         webhooks.construct_event(body=body, secret="whsec_test", signature_header=header)
     assert excinfo.value.reason == "signature_mismatch"
+
+
+ROTATION_BODY = (
+    b'{"id":"evt_x","type":"email.scheduled","created_at":"2026-05-11T20:00:00Z",'
+    b'"data":{"email":{"id":"018e1b7a-1111-7000-aaaa-111111111111",'
+    b'"metadata":{"order_id":"4242"},"status":"SCHEDULED"},"event":{}}}'
+)
+NEW_SECRET = "whsec_new"
+OLD_SECRET = "whsec_old"
+
+
+def _rotation_header(body: bytes, *secrets: str) -> str:
+    """Заголовок с подписью каждым из секретов — как в окне ротации.
+
+    Args:
+        body: Сырое тело.
+        *secrets: Секреты в порядке подписей.
+
+    Returns:
+        Значение `X-MailInfra-Signature` со свежей меткой времени.
+    """
+    now = int(time.time())
+    signatures = ",".join(
+        f"v1={webhooks.sign(body=body, secret=secret, timestamp=now)}" for secret in secrets
+    )
+    return f"t={now},{signatures}"
+
+
+def test_vectors_cover_secret_rotation(webhook_vectors: dict[str, Any]) -> None:
+    """Общие вектора обязаны проверять окно ротации — иначе тест выше пустой."""
+    cases = {case["name"]: case for case in webhook_vectors["cases"]}
+
+    assert cases["rotation_new_secret"]["valid"] is True
+    assert cases["rotation_previous_secret"]["valid"] is True
+    assert cases["rotation_unknown_secret"]["valid"] is False
+    assert cases["rotation_previous_secret"]["signature_header"].count("v1=") == 2
+
+
+@pytest.mark.parametrize("secret", [NEW_SECRET, OLD_SECRET])
+@pytest.mark.parametrize("order", ["new_first", "old_first"])
+def test_rotation_accepts_any_matching_signature(secret: str, order: str) -> None:
+    """Совпала любая `v1` — подпись верна, где бы она ни стояла в заголовке.
+
+    Разбор в словарь оставлял последнюю `v1`: обработчик с новым секретом
+    отвергал события сразу после ротации.
+    """
+    secrets = (NEW_SECRET, OLD_SECRET) if order == "new_first" else (OLD_SECRET, NEW_SECRET)
+    header = _rotation_header(ROTATION_BODY, *secrets)
+
+    assert webhooks.verify(body=ROTATION_BODY, secret=secret, signature_header=header) is True
+    event = webhooks.construct_event(body=ROTATION_BODY, secret=secret, signature_header=header)
+    assert event.type == "email.scheduled"
+
+
+def test_rotation_rejects_unknown_secret() -> None:
+    header = _rotation_header(ROTATION_BODY, NEW_SECRET, OLD_SECRET)
+
+    assert (
+        webhooks.verify(body=ROTATION_BODY, secret="whsec_other", signature_header=header) is False
+    )
+    with pytest.raises(webhooks.WebhookSignatureError) as excinfo:
+        webhooks.construct_event(body=ROTATION_BODY, secret="whsec_other", signature_header=header)
+    assert excinfo.value.reason == "signature_mismatch"
+
+
+def test_rotation_header_with_garbage_signature_still_verifies() -> None:
+    """Мусор в одной `v1` не роняет проверку остальных."""
+    now = int(time.time())
+    valid = webhooks.sign(body=ROTATION_BODY, secret=NEW_SECRET, timestamp=now)
+    header = f"t={now},v1=подпись,v1={valid}"
+
+    assert webhooks.verify(body=ROTATION_BODY, secret=NEW_SECRET, signature_header=header) is True
+
+
+def test_unknown_signature_scheme_is_ignored() -> None:
+    """Будущая схема (`v2=…`) рядом с `v1` не ломает разбор."""
+    now = int(time.time())
+    valid = webhooks.sign(body=ROTATION_BODY, secret=NEW_SECRET, timestamp=now)
+    header = f"t={now},v2=deadbeef,v1={valid}"
+
+    assert webhooks.verify(body=ROTATION_BODY, secret=NEW_SECRET, signature_header=header) is True
+
+
+@pytest.mark.parametrize("header", ["t=1715461200", "v1=deadbeef", "t=soon,v1=deadbeef"])
+def test_header_without_timestamp_or_signature_is_malformed(header: str) -> None:
+    with pytest.raises(webhooks.WebhookSignatureError) as excinfo:
+        webhooks.construct_event(body=b"{}", secret="whsec_test", signature_header=header)
+
+    assert excinfo.value.reason == "malformed_header"
+
+
+def test_event_exposes_email_metadata() -> None:
+    header = _rotation_header(ROTATION_BODY, NEW_SECRET)
+    event = webhooks.construct_event(body=ROTATION_BODY, secret=NEW_SECRET, signature_header=header)
+
+    assert event.metadata == {"order_id": "4242"}
+
+
+def test_event_without_email_has_empty_metadata(webhook_vectors: dict[str, Any]) -> None:
+    case = next(item for item in webhook_vectors["cases"] if item["name"] == "test_ping")
+    event = webhooks.construct_event(
+        body=case["body"].encode("utf-8"),
+        secret=case["secret"],
+        signature_header=case["signature_header"],
+        max_age_seconds=0,
+    )
+
+    assert event.metadata == {}
